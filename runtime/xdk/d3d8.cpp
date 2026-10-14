@@ -822,9 +822,13 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     return 0;
 }
 
-HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 0) {
-    uint32_t reg = a[0];
-    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+// (register, source, dword count) in ecx/edx/stack: the guest original also copies
+// the data into the fast-constant scratch at 0x259AE0 before tail-calling
+// SetVertexShaderConstantNotInlineFast; the host only needs its own constant copy.
+HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 1) {
+    uint32_t reg = a[0], src = a[1], dwords = a[2];
+    for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++)
+        std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
     return 0;
 }
 
@@ -935,6 +939,7 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     return 0;
@@ -942,6 +947,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
 
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
@@ -978,6 +984,7 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
 
 void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride) {
     if (!g_backend || !count || !stride) return;
+    Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     auto stream = g_state.streams[0];
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
@@ -1097,6 +1104,8 @@ void Walk(uint32_t end) {
                 last = m == 0x1524;
                 a[(m - 0x1518) / 4] = f;
             } else {
+                static std::unordered_set<uint32_t> seen;
+                if (seen.insert(m).second) LOGI("d3d: Walk drops method %04X (head %08X, %u values)", m, head, n);
                 continue;
             }
             if (!g_im_prim) continue;
