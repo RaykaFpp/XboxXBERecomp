@@ -1045,6 +1045,19 @@ void EndPrimitive() {
 void Walk(uint32_t end) {
     if (!g_walk || end < g_walk || end > g_scratch_push + g_scratch_size) return;
     for (uint32_t p = g_walk; p + 4 <= end;) {
+        // vertex shader constants pushed inline (the library's Constant1Fast and the
+        // engine's own writer at 0x1DF070): [0x41EA4, register + 96, (dwords << 18) | 0xB80, data...].
+        // Without this the values never reach g_state.vsc and shaders that scale by
+        // c97/c98 (D3D registers 1/2) collapse every vertex to the origin.
+        if (R32(p) == 0x41EA4 && p + 12 <= end) {
+            uint32_t reg = R32(p + 4), hdr = R32(p + 8), n = hdr >> 18;
+            if ((hdr & 0x1FFC) == 0xB80 && p + 12 + n * 4 <= end) {
+                for (uint32_t i = 0; i + 4 <= n; i += 4)
+                    if (reg + i / 4 < 192) std::memcpy(g_state.vsc[reg + i / 4].data(), HostPtr(p + 12 + i * 4), 16);
+                p += 12 + n * 4;
+                continue;
+            }
+        }
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;
@@ -1116,6 +1129,16 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
     static std::vector<uint32_t> vertices;
     uint32_t prim = 0;
     for (uint32_t p = g_push_begin, end = a[0]; g_push_begin && p + 4 <= end;) {
+        // vertex shader constants, same packet as in Walk (see there)
+        if (R32(p) == 0x41EA4 && p + 12 <= end) {
+            uint32_t reg = R32(p + 4), hdr = R32(p + 8), n = hdr >> 18;
+            if ((hdr & 0x1FFC) == 0xB80 && p + 12 + n * 4 <= end) {
+                for (uint32_t i = 0; i + 4 <= n; i += 4)
+                    if (reg + i / 4 < 192) std::memcpy(g_state.vsc[reg + i / 4].data(), HostPtr(p + 12 + i * 4), 16);
+                p += 12 + n * 4;
+                continue;
+            }
+        }
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;

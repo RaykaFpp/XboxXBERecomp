@@ -3183,6 +3183,21 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
         LOG_FIRST(4, "d3d12: all black gamma ramp ignored, the title blanks it for the overlay");
         for (int i = 0; i < 256; i++) ramp_[kRampRed + i] = ramp_[kRampGreen + i] = ramp_[kRampBlue + i] = uint8_t(i);
     }
+    {
+        static int last_mean = -1, last_max = -1;
+        long sum = 0;
+        int mx = 0;
+        for (uint8_t v : ramp_) {
+            sum += v;
+            mx = std::max(mx, int(v));
+        }
+        int mean = int(sum / 768);
+        if (mean != last_mean || mx != last_max) {
+            last_mean = mean;
+            last_max = mx;
+            LOGI("d3d12: gamma ramp mean=%d max=%d (after all-black handling)", mean, mx);
+        }
+    }
     ramp_dirty_ = true;
 }
 
