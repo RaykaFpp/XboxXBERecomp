@@ -3169,6 +3169,20 @@ void D3D12Backend::Capture(Target& t, const char* tag, float mul) {
 
 void D3D12Backend::SetGamma(const uint8_t* ramp) {
     std::memcpy(ramp_, ramp, sizeof(ramp_));
+    // A title that plays video through the console's YUV overlay blanks the framebuffer's ramp while
+    // it runs, because the overlay is shown instead of the framebuffer. This renderer has no overlay:
+    // it draws the video into the framebuffer, so an all black ramp would hide the picture. Keep the
+    // identity ramp for it; every ramp with any output in it is applied as the title asked.
+    bool black = true;
+    for (uint8_t v : ramp_)
+        if (v != 0) {
+            black = false;
+            break;
+        }
+    if (black) {
+        LOG_FIRST(4, "d3d12: all black gamma ramp ignored, the title blanks it for the overlay");
+        for (int i = 0; i < 256; i++) ramp_[kRampRed + i] = ramp_[kRampGreen + i] = ramp_[kRampBlue + i] = uint8_t(i);
+    }
     ramp_dirty_ = true;
 }
 

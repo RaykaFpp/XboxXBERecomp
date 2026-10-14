@@ -503,10 +503,15 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     kernel::SetSavedDataAddress(0);
     // the ramp an inlined SetGammaRamp left for the vertical blank that shows this swap
     if (g_backend && XDK_CDevice_GammaPending != xdk::kUnknown && XDK_CDevice_GammaRamps != xdk::kUnknown) {
-        uint32_t i = Dev(kDevSwapCount) & 1;
-        if (Dev(XDK_CDevice_GammaPending + i * 4) == 1) {
-            SetDev(XDK_CDevice_GammaPending + i * 4, 0);
-            g_backend->SetGamma(static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300)));
+        // the slot an inlined SetGammaRamp writes does not always match this swap's parity, so take
+        // whichever slot is pending, the one for this swap last
+        uint32_t cur = Dev(kDevSwapCount) & 1;
+        for (uint32_t k = 0; k < 2; k++) {
+            uint32_t i = (cur + 1 + k) & 1;
+            if (Dev(XDK_CDevice_GammaPending + i * 4) == 1) {
+                SetDev(XDK_CDevice_GammaPending + i * 4, 0);
+                g_backend->SetGamma(static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300)));
+            }
         }
     }
     if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
