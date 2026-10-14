@@ -438,7 +438,7 @@ static void AuditExports() {
         SYM(IDirectSoundBuffer_StopEx),
         SYM(XAudioDownloadEffectsImage), SYM(DirectSoundCreateBuffer), SYM(IDirectSound_CreateSoundBuffer),
         SYM(IDirectSoundBuffer_Release), SYM(IDirectSoundBuffer_Unlock), SYM(IDirectSoundBuffer_SetBufferData),
-        SYM(IDirectSoundBuffer_Play), SYM(IDirectSoundBuffer_PlayEx), SYM(IDirectSoundBuffer_Stop), SYM(IDirectSoundBuffer_SetLoopRegion),
+        SYM(IDirectSoundBuffer_Play), SYM(IDirectSoundBuffer_PlayEx), SYM(IDirectSoundBuffer_Stop), SYM(IDirectSoundBuffer_Pause), SYM(IDirectSoundBuffer_SetLoopRegion),
         SYM(IDirectSoundBuffer_GetStatus), SYM(IDirectSoundBuffer_GetCurrentPosition), SYM(IDirectSoundBuffer_SetCurrentPosition),
         SYM(IDirectSoundBuffer_Lock), SYM(IDirectSoundBuffer_SetVolume), SYM(IDirectSoundBuffer_SetFrequency),
         SYM(IDirectSoundBuffer_SetFilter), SYM(IDirectSoundBuffer_SetHeadroom), SYM(IDirectSoundBuffer_SetMixBinVolumes),
@@ -650,6 +650,15 @@ BUFFER(Stop, 1) {
 // (this, time low, time high, flags): stops now, the release envelope is not reproduced
 BUFFER(StopEx, 4) {
     v.playing = false;
+    return 0;
+}
+// (this, mode): 1 pauses, 2 pauses until IDirectSound_SynchPlayback, 0 resumes.
+// Wired from the guest's xtlid 0xB0057 entry, whose original code forwards the
+// mode to the buffer's inner object; on a host buffer object that inner
+// pointer is null and the guest code faults reading it.
+BUFFER(Pause, 2) {
+    v.paused = a[1] == 1;
+    v.sync = a[1] == 2;
     return 0;
 }
 // (this, start, length) in bytes, 0 length plays to the end. The loop becomes the whole region.
