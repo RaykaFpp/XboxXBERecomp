@@ -68,10 +68,14 @@ HLE_STDCALL(XInitDevices, 2) {
 
 HLE_STDCALL(XInputOpen, 4) {
     uint32_t type = a[0], port = a[1];
-    if (type != kGamepadType || port > 3) return 0;
+    if (type != kGamepadType || port > 3) {
+        LOGI("xapi: XInputOpen rejected type=0x%X (want 0x%X) port=%u", type, kGamepadType, port);
+        return 0;
+    }
     uint32_t h = mem::AllocSystem(16);
     std::lock_guard<std::mutex> lock(g_ports_lock);
     g_handles[h] = {port, 0, {}};
+    LOGI("xapi: XInputOpen port=%u handle=0x%X", port, h);
     return h;
 }
 
@@ -91,11 +95,21 @@ HLE_STDCALL(XInputGetState, 2) {
         port = it->second.port;
     }
     input::Pad p = input::Poll(int(port));
-    if (!p.connected) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
+    if (!p.connected) {
+        LOG_FIRST(4, "xapi: XInputGetState port=%u not connected", port);
+        return 1167;  // ERROR_DEVICE_NOT_CONNECTED
+    }
     std::lock_guard<std::mutex> lock(g_ports_lock);
     Handle& h = g_handles[a[0]];
+    const bool buttons_changed = p.buttons != h.last.buttons || std::memcmp(p.analog, h.last.analog, 8) != 0;
     if (std::memcmp(&p, &h.last, sizeof(p))) h.packet++;
     h.last = p;
+    if (buttons_changed)
+        LOGI("xapi: XInputGetState port=%u packet=%u wButtons=0x%04X analog=%02X %02X %02X %02X %02X %02X %02X %02X", port,
+             h.packet, p.buttons, p.analog[0], p.analog[1], p.analog[2], p.analog[3], p.analog[4], p.analog[5], p.analog[6],
+             p.analog[7]);
+    else
+        LOG_FIRST(2, "xapi: XInputGetState port=%u first state packet=%u wButtons=0x%04X", port, h.packet, p.buttons);
     uint32_t s = a[1];
     W32(s, h.packet);  // XINPUT_STATE: packet, buttons, 8 analog buttons, thumbs
     W16(s + 4, p.buttons);
