@@ -149,6 +149,7 @@ IDirectSoundBuffer_GetCurrentPosition = {sec = "DSOUND", len = 0x20, hash = "0x5
 IDirectSoundBuffer_GetStatus = {sec = "DSOUND", len = 0x1C, hash = "0x3BA8DAE65E120FD6", xtlid = 0xB0054, deep = true, calls = [[0x51, "0xBCCF9F0C46F7ABDF", [[0x1E, "0x77CF69460E7107DD"], [0x42, "0xAC82B5929C476085"]]]], ret = 8, regs = []}
 IDirectSoundBuffer_Lock = {sec = "DSOUND", len = 0x30, hash = "0x5B6EA09A2CCF537D", xtlid = 0xB0056, calls = [[0xE2, "0x1E0C3D10AF47B37D", [[0x1E, "0x77CF69460E7107DD"], [0x55, "0xE60F054C4E847816"]]]], ret = 32, regs = []}
 IDirectSoundBuffer_Play = {sec = "DSOUND", len = 0x24, hash = "0x16089413899A14CC", xtlid = 0xB0059, calls = [[0x51, "0x9C8E2BA2A67E258F", [[0x1E, "0x77CF69460E7107DD"], [0xB0, "0x5D41E5249A8F3D04"]]]], ret = 16, regs = []}
+IDirectSoundBuffer_PlayEx = {xtlid = 0xB005A}
 IDirectSoundBuffer_Release = {sec = "DSOUND", len = 0x16, hash = "0x4FA5AC4A92DAE1E3", xtlid = 0xB005D, ret = 4, regs = []}
 IDirectSoundBuffer_SetAllParameters = {xtlid = 0xB005F}
 IDirectSoundBuffer_SetBufferData = {sec = "DSOUND", len = 0x20, hash = "0x58625E847EC088E7", xtlid = 0xB0060, calls = [[0xAE, "0x69BB93C1FC1404CE", [[0x1E, "0x77CF69460E7107DD"], [0x31, "0xC96EAFC107098818"], [0x8C, "0x7CCE0F3D8E824EA6"], [0x1A, "0xBEAA27CDE7C45CEC"]]]], ret = 12, regs = []}
