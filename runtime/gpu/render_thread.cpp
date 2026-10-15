@@ -116,7 +116,7 @@ public:
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         auto t = Clock::now();
-        SendState(s);
+        { auto ts = Clock::now(); SendState(s); g_perf_sendstate_ns += Ns(ts); }
         Cmd c{Op::Draw};
         c.a = prim;
         c.b = start;
@@ -138,7 +138,7 @@ public:
 
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override {
         auto t = Clock::now();
-        SendState(s);
+        { auto ts = Clock::now(); SendState(s); g_perf_sendstate_ns += Ns(ts); }
         Cmd c{Op::Clear};
         c.a = count;
         c.b = flags;

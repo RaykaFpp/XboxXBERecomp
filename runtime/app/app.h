@@ -22,6 +22,9 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
+    // the shape the frame is drawn and shown at: auto is the real output aspect, else 4:3, 16:9, 16:10, 21:9 or 32:9
+    std::string aspect_ratio = "auto";
+    bool ultrawide = true;  // false: the frame stays 16:9 and every number below is exactly what it was
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 
@@ -39,6 +42,12 @@ Mode Output();
 float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
 bool Widescreen();
+// how much wider than 16:9 the frame is rendered, 1 to 4; exactly 1 when ultrawide is off, the output is not
+// widescreen, or the chosen aspect is no wider than 16:9. widening moves the viewport offset, never its scale,
+// so the extra width is extra world at the sides: Hor+ at an unchanged vertical field of view
+float AspectWiden();
+// the aspect the frame is presented at: the widened 16:9 on a widescreen output, else 4:3
+float TargetAspect();
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc

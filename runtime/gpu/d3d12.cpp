@@ -73,6 +73,12 @@ struct Perf {
     double wait = 0;
     double swap = 0;
     double sync = 0;
+    // of draw: targets, shader/pso lookup, constants, views/samplers, geometry upload + draw call
+    double tgt = 0;
+    double pso = 0;
+    double consts = 0;
+    double views = 0;
+    double geom = 0;
     // counts and bytes
     uint64_t draws = 0;
     uint64_t verts = 0;
@@ -398,6 +404,7 @@ struct DrawShaders {
 struct GuestExtent {
     uint32_t w;
     uint32_t h;
+    float dx = 0;  // guest x of the console frame's left edge inside a widened frame, 0 for every other target
 };
 
 class D3D12Backend final : public Backend, public Context {
@@ -517,7 +524,7 @@ private:
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
-    void SetViewportScissor(const State& s, uint32_t gw);
+    void SetViewportScissor(const State& s, GuestExtent size);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
@@ -579,6 +586,10 @@ private:
     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
     bool TargetStale(uint32_t data) const;
     void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it);
+    // the main frame is drawn wider than the console's so an ultrawide display shows more world at the sides
+    uint32_t WidenedGuestWidth() const;
+    bool IsFrameTarget(const Target& t) const;
+    GuestExtent BoundExtent(const Surface& s) const;
     bool CreateTargetResource(Target& t, const Surface& s);
     bool CreateTargetView(Target& t);
     // UploadTarget, then its step
@@ -678,6 +689,7 @@ private:
     uint32_t bb_w_ = 0;
     uint32_t bb_h_ = 0;
     float scale_ = 1.0f;
+    float widen_ = 1.0f;  // the frame target's width over the console's, latched with scale_
     // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
     struct Late {
         ComPtr<ID3D12Resource> rb[kFrames];
@@ -854,6 +866,7 @@ void D3D12Backend::CreateGammaLut() {
 
 void D3D12Backend::LoadSettings() {
     scale_ = app::RenderScale(guest_h_);
+    widen_ = app::AspectWiden();
     ext_ = g_extension.get();
     if (ext_) {
         ext_->Settings();
@@ -962,11 +975,35 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
     targets_.erase(it);
 }
 
+// the console's frame drawn wider so an ultrawide display shows more world; every other target keeps its size,
+// so shadow maps and post-process chains are untouched
+uint32_t D3D12Backend::WidenedGuestWidth() const {
+    return std::max(guest_w_, uint32_t(std::lround(guest_w_ * widen_)));
+}
+
+bool D3D12Backend::IsFrameTarget(const Target& t) const { return t.gw == guest_w_ && t.gh == guest_h_; }
+
+// the guest pixel space a draw maps onto: the surface's own, widened and centred when the frame target is bound
+GuestExtent D3D12Backend::BoundExtent(const Surface& s) const {
+    GuestExtent e;
+    SurfaceSize(s, e.w, e.h);
+    const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
+    if (t && t->dx != 0 && t->gw == e.w && t->gh == e.h) {
+        e.dx = t->dx;
+        e.w = t->gw + uint32_t(std::lround(t->dx * 2));
+    }
+    return e;
+}
+
 // the host texture of a new target, at render scale or the extension's
 bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     float sc = scale_;
     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
-    t.w = std::max(1u, uint32_t(std::lround(t.gw * sc)));
+    // the frame keeps its guest extent: only the pixels behind it grow, and the viewport fold's offset moves
+    // the world to the new centre, which leaves the console's 640 x 480 view of itself untouched
+    uint32_t gw = IsFrameTarget(t) ? WidenedGuestWidth() : t.gw;
+    t.dx = (gw - t.gw) / 2.0f;
+    t.w = std::max(1u, uint32_t(std::lround(gw * sc)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
@@ -2060,7 +2097,7 @@ void FillTransformConstants(const State& s, GuestExtent size, DrawConstants& c) 
     const auto& v = s.viewport;
     float sx = float(v.w) / gw;
     float sy = float(v.h) / gh;
-    float ox = (2.0f * v.x + v.w) / gw - 1;
+    float ox = (2.0f * (v.x + size.dx) + v.w) / gw - 1;
     float oy = 1 - (2.0f * v.y + v.h) / gh;
     float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, v.max_z - v.min_z, 0, ox, oy, v.min_z, 1};
     float full[16];
@@ -2267,21 +2304,27 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
-void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+void D3D12Backend::SetViewportScissor(const State& s, GuestExtent size) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
     cl_->RSSetViewports(1, &vp);
-    float sc = W / gw;
-    LONG x0 = LONG(s.viewport.x * sc);
+    float sc = W / size.w;
+    LONG x0 = LONG((s.viewport.x + size.dx) * sc);
     LONG y0 = LONG(s.viewport.y * sc);
-    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
+    LONG x1 = LONG((s.viewport.x + s.viewport.w + size.dx) * sc);
     LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
     if (s.scissor_count) {
-        x0 = std::max(x0, LONG(s.scissors[0] * sc));
+        x0 = std::max(x0, LONG((s.scissors[0] + size.dx) * sc));
         y0 = std::max(y0, LONG(s.scissors[1] * sc));
-        x1 = std::min(x1, LONG(s.scissors[2] * sc));
+        x1 = std::min(x1, LONG((s.scissors[2] + size.dx) * sc));
         y1 = std::min(y1, LONG(s.scissors[3] * sc));
+    }
+    // the widened frame: what reaches the console frame's sides reaches the target's, or the extra width the
+    // geometry now covers would be clipped away again
+    if (size.dx != 0) {
+        if (x0 <= LONG(size.dx * sc)) x0 = 0;
+        if (x1 >= LONG((float(size.w) - size.dx) * sc)) x1 = LONG(W);
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
@@ -2359,36 +2402,44 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
-    if (!BindTargets(s)) return;
-    if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
+    {
+        PerfScope perf_targets{g_perf.tgt};
+        if (!BindTargets(s)) return;
+        if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
+    }
 
     // vertex shader
-    DrawShaders sh = ClassifyShaders(s, a, count);
-    if (sh.prog) EnsureProgramHash(s);
-    sh.vkey = VertexKey(s, a, sh);
-    EnsureVertexShader(s, a, sh);
-
+    DrawShaders sh;
+    {
+        PerfScope perf_pso{g_perf.pso};
+        sh = ClassifyShaders(s, a, count);
+        if (sh.prog) EnsureProgramHash(s);
+        sh.vkey = VertexKey(s, a, sh);
+        EnsureVertexShader(s, a, sh);
+    }
     // stage textures, then the pixel shader made for them
     DrawTextures stages;
     if (!BindStageTexturesAndTargets(s, stages)) return;
-    PixelKey pk = MakePixelKey(s, stages.info);
-    pk.quad = sh.quad;
-    sh.pkey = Hash(&pk, sizeof(pk));
-    EnsurePixelShader(pk, sh);
-    if (!sh.vs_code || !sh.ps_code) return;
-
-    // pipeline
     PsoKey k;
-    BuildPipelineKey(s, a, sh.vh, sh.ph, k);
-    ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    PixelKey pk;
+    ID3D12PipelineState* pso = nullptr;
+    {
+        PerfScope perf_pso{g_perf.pso};
+        pk = MakePixelKey(s, stages.info);
+        pk.quad = sh.quad;
+        sh.pkey = Hash(&pk, sizeof(pk));
+        EnsurePixelShader(pk, sh);
+        if (!sh.vs_code || !sh.ps_code) return;
+        BuildPipelineKey(s, a, sh.vh, sh.ph, k);
+        pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
+    }
     if (!pso) return;
     cl_->SetPipelineState(pso);
 
     // constants
-    GuestExtent size;
-    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+    GuestExtent size = BoundExtent(bound_rt_ ? s.rt : s.zs);
     DrawConstants c{};
-    UploadConstants(s, sh, k, stages, size, c);
+    { PerfScope perf_consts{g_perf.consts}; UploadConstants(s, sh, k, stages, size, c); }
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
@@ -2397,19 +2448,30 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
-    SetTextureViewsAndSamplers(s, a, stages);
-    SetViewportScissor(s, size.w);
-    SetBlendFactorStencilRef(s);
+    {
+        PerfScope perf_views{g_perf.views};
+        SetTextureViewsAndSamplers(s, a, stages);
+        SetViewportScissor(s, size);
+        SetBlendFactorStencilRef(s);
+    }
 
     // geometry
-    DrawGeometry(a);
+    { PerfScope perf_geom{g_perf.geom}; DrawGeometry(a); }
 }
 
-// a guest rect scaled to the target and clamped to it
+// a guest rect scaled to the target and clamped to it; the frame target is wider than the console's frame, so
+// the rect moves to its centre and one that spans the console's frame spans the widened target
 D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
-    float sc = float(t.w) / t.gw;
-    return {std::clamp<LONG>(LONG(x0 * sc), 0, t.w), std::clamp<LONG>(LONG(y0 * sc), 0, t.h),
-            std::clamp<LONG>(LONG(x1 * sc), 0, t.w), std::clamp<LONG>(LONG(y1 * sc), 0, t.h)};
+    float gw = float(t.gw) + t.dx * 2;
+    float sc = float(t.w) / gw;
+    LONG rx0 = LONG((x0 + t.dx) * sc);
+    LONG rx1 = LONG((x1 + t.dx) * sc);
+    if (t.dx != 0) {
+        if (x0 <= 0) rx0 = 0;
+        if (x1 >= int(t.gw)) rx1 = LONG(t.w);
+    }
+    return {std::clamp<LONG>(rx0, 0, t.w), std::clamp<LONG>(LONG(y0 * sc), 0, t.h),
+            std::clamp<LONG>(rx1, 0, t.w), std::clamp<LONG>(LONG(y1 * sc), 0, t.h)};
 }
 
 // rs: the rects buffer, reused across targets
@@ -2719,9 +2781,8 @@ void D3D12Backend::UploadGammaRamp() {
 }
 
 void D3D12Backend::BlitFrame(Target& t) {
-    // 16:9 when the console reports a widescreen display, else 4:3
-    bool wide = app::Widescreen();
-    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    // the frame is already drawn at the shape it is shown at: 16:9 widened to the output, or 4:3
+    float aspect = app::TargetAspect();
     float w = float(bb_w_);
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
@@ -2817,14 +2878,17 @@ void LogPerf() {
              p.compile / n, p.clear / n, p.copy / n, p.sync / n, p.present / n, p.swap / n, p.wait / n,
              (el - host) / n);
         LOGI("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
-             "resource %.2f fence %.2f flush %.2f copy %.2f, next frame %.2f) | read-backs waited for: %.1f lock, "
+             "resource %.2f fence %.2f flush %.2f copy %.2f, next frame %.2f) | in XDK draws %.2f (of it sendstate %.2f) | read-backs waited for: %.1f lock, "
              "%.1f NOOVERWRITE",
              g_perf_capture_ns.exchange(0) / n / 1e6, g_perf_wait_ns.exchange(0) / n / 1e6,
              g_perf_waits.exchange(0) / n, g_perf_wait_kind_ns[0].exchange(0) / n / 1e6,
              g_perf_wait_kind_ns[1].exchange(0) / n / 1e6, g_perf_wait_kind_ns[2].exchange(0) / n / 1e6,
              g_perf_wait_kind_ns[3].exchange(0) / n / 1e6, g_perf_wait_kind_ns[4].exchange(0) / n / 1e6,
-             g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
+             g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_hle_ns.exchange(0) / n / 1e6,
+             g_perf_sendstate_ns.exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
              g_perf_sync_late.exchange(0) / n);
+        LOGI("perf: render draw split: targets %.2f pso %.2f consts %.2f views %.2f geom %.2f (assemble %.2f bind %.2f)",
+             p.tgt / n, p.pso / n, p.consts / n, p.views / n, p.geom / n, p.assemble / n, p.bind / n);
         LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
              "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
@@ -2872,12 +2936,14 @@ void D3D12Backend::Present(const Surface& front) {
 
 void D3D12Backend::ApplySettings() {
     float want = app::RenderScale(guest_h_);
+    float wide = app::AspectWiden();
     bool remake = ext_ && ext_->Settings();
-    if (std::fabs(want - scale_) > 1e-4f || remake) {
+    if (std::fabs(want - scale_) > 1e-4f || std::fabs(wide - widen_) > 1e-4f || remake) {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();
         scale_ = want;
+        widen_ = wide;
         if (ext_) ext_->Reset(*this);
         bound_rt_ = bound_ds_ = nullptr;
     }

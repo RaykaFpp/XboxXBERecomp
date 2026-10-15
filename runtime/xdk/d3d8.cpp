@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <thread>
 #include <unordered_map>
@@ -50,6 +51,16 @@ namespace {
 #endif
 constexpr bool kRenderThread = XBE_RENDER_THREAD;
 
+// perf diagnostic: title time inside one XDK draw call, into gpu::g_perf_hle_ns
+struct HleScope {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    ~HleScope() {
+        if (diag::Perf())
+            gpu::g_perf_hle_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - t).count());
+    }
+};
+
 // D3D globals of this build
 constexpr uint32_t kDevice = SYM(D3D_Device);        // the static CDevice, g_pDevice points at it
 constexpr uint32_t kDevicePtr = SYM(D3D_pDevice);
@@ -80,6 +91,7 @@ std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
+uint32_t g_frame_w = 640, g_frame_h = 480;  // the console's frame, what the title asked CreateDevice for
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
 
@@ -171,6 +183,56 @@ float ZScale(const gpu::Surface& zs) {
     return f == 0x2C || f == 0x30 ? 65535.0f : 16777215.0f;
 }
 
+// The main frame is drawn wider than the console's so an ultrawide display shows more world. The transform to
+// console pixels is a scale and an offset: the scale stays, so the picture keeps its pixels per degree and its
+// vertical field of view, and the offset moves to the widened frame's centre. Hor+, no stretch. Only the main
+// frame grows, so a pass drawn into an off-screen surface of another size keeps its own centre and its own
+// numbers. Zero on 16:9 or with ultrawide off, and then nothing below it runs.
+float FrameCentreShift() {
+    float dx = float(std::lround(g_frame_w * app::AspectWiden()) - long(g_frame_w)) * 0.5f;
+    if (dx == 0) return 0;
+    uint32_t w = 0, h = 0;
+    gpu::SurfaceSize(g_state.rt.header ? g_state.rt : g_state.zs, w, h);
+    return w == g_frame_w && h == g_frame_h ? dx : 0;
+}
+
+constexpr uint32_t kVscCount = 192;
+// Where that shift lands, read off the vertex programs this title really ran - the renderer's own translations
+// in out/build/verbose/cap*/*/vs_*.hlsl and the constants dumped beside them in frame.txt:
+//  - world: oPos = dot(v0, c[129..132]), then oPos.xyz *= c[97].xyz, then oPos.xyz = oPos.xyz / oPos.w +
+//    c[98].xyz. c97 was (320, -224, ...) and c98 (320.031, 240.031, ...): the engine's own copy of the viewport
+//    fold the XDK writes to c[58] and c[59]. Its horizontal centre is c98.x.
+//  - 2D and HUD: oPos = dot(v0, c[121..124]) and nothing more, never touching c[97] or c[98]. c25 to c28
+//    (hardware 121 to 124) held (640,0,0,0.03125) (0,448,0,16.0312) (0,0,z,0) (0,0,0,1) in all 1770 captured
+//    draws: unit screen coordinates to console pixels by dp4, with every quad's w at 1, so its horizontal
+//    translation is c25.w. The 2D batcher (guest sub_001D9ED0) also pushes its model matrix to c65 to c68, but
+//    no program reads that as a position transform, so it is left alone.
+// Of the six programs captured, three read the fold and three read the screen matrix and none read both, so a
+// draw is shifted once or not at all.
+constexpr uint32_t kVscFoldOffset = 98;  // the engine's viewport offset, horizontal in .x
+constexpr uint32_t kVscScreen = 121;     // the 2D unit to pixel matrix, horizontal in .w
+
+// a constant has just been stored: centre it when it is the horizontal translation into console pixels
+void CentreVsConstant(uint32_t r) {
+    if (r != kVscFoldOffset && r != kVscScreen) return;
+    float dx = FrameCentreShift();
+    if (dx == 0) return;
+    g_state.vsc[r][r == kVscFoldOffset ? 0 : 3] += dx;
+}
+
+// the vertex shader constants of one inline push packet: [kVscPush, register + 96, (dwords << 18) | kVscMethod,
+// data...]. Both push buffer readers go through here, so the centre shift cannot drift between them.
+constexpr uint32_t kVscPush = 0x41EA4;
+constexpr uint32_t kVscMethod = 0xB80;
+void StoreVsConstants(uint32_t reg, uint32_t n, uint32_t data) {
+    for (uint32_t i = 0; i + 4 <= n; i += 4) {
+        uint32_t r = reg + i / 4;
+        if (r >= kVscCount) continue;
+        std::memcpy(g_state.vsc[r].data(), HostPtr(data + i * 4), 16);
+        CentreVsConstant(r);
+    }
+}
+
 bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are the title's
 
 // c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them
@@ -180,7 +242,8 @@ void UpdateViewportConstants() {
     float hw = v.w * 0.5f, hh = v.h * 0.5f;
     if (!g_own_constants) {
         g_state.vsc[58] = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
-        g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw, v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
+        g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw + FrameCentreShift(),
+                           v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
     }
     // the viewport as the library's SetViewport stores it, for inlined readers
     if (XDK_CDevice_Viewport != xdk::kUnknown) {
@@ -266,6 +329,8 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
     if (!w) w = 640;
     if (!h) h = 480;
+    g_frame_w = w;
+    g_frame_h = h;
     LOGI("d3d: CreateDevice %ux%u format %X buffers %u depth %u format %X interval %X flags %X", w, h, fmt, count,
          auto_depth, depth_fmt, interval, R32(pp + 0x28));
     std::memset(HostPtr(kDevice), 0, XDK_CDevice_Size);
@@ -814,7 +879,10 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
             g_state.vs = it->second;
             // constants declared with the shader load when it is selected
             for (auto& [reg, v] : it->second->constants)
-                if (reg < 192) g_state.vsc[reg] = v;
+                if (reg < kVscCount) {
+                    g_state.vsc[reg] = v;
+                    CentreVsConstant(reg);
+                }
         } else {
             LOG_FIRST(8, "d3d: SetVertexShader with unknown handle %08X", h);
         }
@@ -827,26 +895,37 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
 // SetVertexShaderConstantNotInlineFast; the host only needs its own constant copy.
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 1) {
     uint32_t reg = a[0], src = a[1], dwords = a[2];
-    for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++)
+    for (uint32_t i = 0; i < dwords / 4 && reg + i < kVscCount; i++) {
         std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        CentreVsConstant(reg + i);
+    }
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
     uint32_t reg = a[0];
-    if (reg < 192) std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+    if (reg < kVscCount) {
+        std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+        CentreVsConstant(reg);
+    }
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant4, 0) {
     uint32_t reg = a[0], src = a[1];
-    for (uint32_t i = 0; i < 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+    for (uint32_t i = 0; i < 4 && reg + i < kVscCount; i++) {
+        std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        CentreVsConstant(reg + i);
+    }
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
     uint32_t reg = a[0], src = a[1], dwords = a[2];
-    for (uint32_t i = 0; i < dwords / 4 && reg + i < 192; i++) std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+    for (uint32_t i = 0; i < dwords / 4 && reg + i < kVscCount; i++) {
+        std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        CentreVsConstant(reg + i);
+    }
     return 0;
 }
 
@@ -939,6 +1018,7 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
@@ -947,6 +1027,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
 
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
@@ -1056,11 +1137,10 @@ void Walk(uint32_t end) {
         // engine's own writer at 0x1DF070): [0x41EA4, register + 96, (dwords << 18) | 0xB80, data...].
         // Without this the values never reach g_state.vsc and shaders that scale by
         // c97/c98 (D3D registers 1/2) collapse every vertex to the origin.
-        if (R32(p) == 0x41EA4 && p + 12 <= end) {
+        if (R32(p) == kVscPush && p + 12 <= end) {
             uint32_t reg = R32(p + 4), hdr = R32(p + 8), n = hdr >> 18;
-            if ((hdr & 0x1FFC) == 0xB80 && p + 12 + n * 4 <= end) {
-                for (uint32_t i = 0; i + 4 <= n; i += 4)
-                    if (reg + i / 4 < 192) std::memcpy(g_state.vsc[reg + i / 4].data(), HostPtr(p + 12 + i * 4), 16);
+            if ((hdr & 0x1FFC) == kVscMethod && p + 12 + n * 4 <= end) {
+                StoreVsConstants(reg, n, p + 12);
                 p += 12 + n * 4;
                 continue;
             }
@@ -1120,6 +1200,7 @@ void Walk(uint32_t end) {
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
     return 0;
 }
@@ -1134,16 +1215,16 @@ HLE_STDCALL(D3DDevice_BeginPush, 1) {
 
 HLE_STDCALL(D3DDevice_EndPush, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     constexpr uint32_t kBeginEnd = 0x17FC, kInlineArray = 0x1818;
     static std::vector<uint32_t> vertices;
     uint32_t prim = 0;
     for (uint32_t p = g_push_begin, end = a[0]; g_push_begin && p + 4 <= end;) {
         // vertex shader constants, same packet as in Walk (see there)
-        if (R32(p) == 0x41EA4 && p + 12 <= end) {
+        if (R32(p) == kVscPush && p + 12 <= end) {
             uint32_t reg = R32(p + 4), hdr = R32(p + 8), n = hdr >> 18;
-            if ((hdr & 0x1FFC) == 0xB80 && p + 12 + n * 4 <= end) {
-                for (uint32_t i = 0; i + 4 <= n; i += 4)
-                    if (reg + i / 4 < 192) std::memcpy(g_state.vsc[reg + i / 4].data(), HostPtr(p + 12 + i * 4), 16);
+            if ((hdr & 0x1FFC) == kVscMethod && p + 12 + n * 4 <= end) {
+                StoreVsConstants(reg, n, p + 12);
                 p += 12 + n * 4;
                 continue;
             }
@@ -1184,6 +1265,7 @@ HLE_STDCALL(D3DDevice_SetTile, 2) { return 0; }
 HLE_STDCALL(D3DDevice_Begin, 1) {
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Flags));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     Walk(Dev(kDevPush));
     g_im_prim = a[0];
     g_im_mask = 0;
@@ -1195,6 +1277,7 @@ HLE_STDCALL(D3DDevice_Begin, 1) {
 HLE_STDCALL(D3DDevice_End, 0) {
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Flags));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    HleScope hle;
     Walk(Dev(kDevPush));
     EndPrimitive();
     SetDev(XDK_CDevice_Flags, Dev(XDK_CDevice_Flags) & ~0x1800u);

@@ -25,6 +25,7 @@ struct Target {
     Microsoft::WRL::ComPtr<ID3D12Resource> res;
     bool depth = false;
     uint32_t gw = 0, gh = 0, w = 0, h = 0;
+    float dx = 0;  // guest x the console's frame starts at inside this one: half the ultrawide extra width
     uint32_t view = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     uint32_t data = 0, bytes = 0;
