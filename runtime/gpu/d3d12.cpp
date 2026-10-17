@@ -13,23 +13,15 @@
 #include <wrl/client.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <filesystem>
-#include <functional>
-#include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx12.h>
@@ -61,12 +53,6 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
-
-// a switch from the environment, read once: set to anything but empty or "0"
-bool EnvOn(const char* name) {
-    const char* v = std::getenv(name);
-    return v && *v && std::strcmp(v, "0") != 0;
-}
 
 // perf diagnostic: where a frame's time goes, logged once a second with diag::Perf
 using PerfClock = std::chrono::steady_clock;
@@ -111,45 +97,13 @@ struct Perf {
     uint64_t shaders = 0;
     uint64_t raw = 0;
     uint64_t lates = 0;
-    // the fast paths: draws or stages that took the draw before's result, and draws left waiting for a pipeline
-    uint64_t stage_reuse = 0;
-    uint64_t view_reuse = 0;
-    uint64_t sampler_reuse = 0;
-    uint64_t vs_reuse = 0;
-    uint64_t ps_reuse = 0;
-    uint64_t pso_reuse = 0;
-    uint64_t pso_bound = 0;
-    uint64_t vsc_reuse = 0;
-    uint64_t const_reuse = 0;
-    uint64_t rebinds = 0;
-    uint64_t probes = 0;
-    uint64_t deferred = 0;
 };
 Perf g_perf;
-// times its scope into acc with diag::Perf on; off, the clock is never read
 struct PerfScope {
-    double* acc;
-    PerfClock::time_point t;
-    explicit PerfScope(double& a) : acc(diag::Perf() ? &a : nullptr) {
-        if (acc) t = PerfClock::now();
-    }
-    ~PerfScope() {
-        if (acc) *acc += PerfMs(t);
-    }
-    PerfScope(const PerfScope&) = delete;
-    PerfScope& operator=(const PerfScope&) = delete;
+    double& acc;
+    PerfClock::time_point t = PerfClock::now();
+    ~PerfScope() { acc += PerfMs(t); }
 };
-
-// shader and pipeline making, counted on whichever thread does it, logged once a second with diag::Perf
-struct MadeStats {
-    std::atomic<uint64_t> compile_ns{0};  // D3DCompile, on every thread
-    std::atomic<uint64_t> compiled{0};
-    std::atomic<uint64_t> disk_shaders{0};
-    std::atomic<uint64_t> psos{0};       // pipelines made without a stored blob
-    std::atomic<uint64_t> disk_psos{0};  // pipelines made from a stored blob
-    std::atomic<uint64_t> refused{0};    // stored blobs the driver turned down
-};
-MadeStats g_made;
 
 // F3 captures only with diag::CaptureDir set
 bool CaptureOn() {
@@ -285,7 +239,6 @@ DXGI_FORMAT HostFormat(Host h) {
 
 constexpr uint32_t kFmtD16 = 0x2C;     // D3DFMT_D16
 constexpr uint32_t kFmtLinD16 = 0x30;  // D3DFMT_LIN_D16
-constexpr uint32_t kFmtP8 = 0x0B;      // D3DFMT_P8
 
 // TexInfo::shadow of a depth texture
 uint8_t ShadowDepthKind(uint32_t format) { return format == kFmtD16 || format == kFmtLinD16 ? 2 : 1; }
@@ -370,7 +323,6 @@ struct Tex {
     uint64_t sig = 0;
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
-    uint64_t bytes = 0;    // video memory the resource takes
     uint8_t flags = 0;  // Extension::Decoded's
 };
 
@@ -430,24 +382,11 @@ struct DrawTextures {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv[4];
     ID3D12Resource* res[4];
     bool rt[4] = {};            // stage samples a render target
-    bool pal[4] = {};           // stage samples a P8 texture
     float k[4] = {1, 1, 1, 1};  // Extension::Sample's k
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
 };
 
-// a shader by content hash: code is set before done, null when it failed to compile
-struct ShaderEntry {
-    std::atomic<bool> done{false};
-    ComPtr<ID3DBlob> code;
-};
-
-// a pipeline by key: pso is set before done, null when it could not be made
-struct PipelineEntry {
-    std::atomic<bool> done{false};
-    ComPtr<ID3D12PipelineState> pso;
-};
-
-// a draw's shaders: what they are made from, their cache keys, the content hashes and the shaders made from them
+// a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
 struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool quad = false;
@@ -457,12 +396,9 @@ struct DrawShaders {
     uint64_t vh = 0;
     uint64_t pkey = 0;
     uint64_t ph = 0;
-    ShaderEntry* vs = nullptr;
-    ShaderEntry* ps = nullptr;
+    ID3DBlob* vs_code = nullptr;
+    ID3DBlob* ps_code = nullptr;
 };
-
-// done, without a shader: it failed to compile
-bool Failed(const ShaderEntry& e) { return e.done.load(std::memory_order_acquire) && !e.code; }
 
 // the render target's console size in pixels, or the depth buffer's without one
 struct GuestExtent {
@@ -470,353 +406,6 @@ struct GuestExtent {
     uint32_t h;
     float dx = 0;  // guest x of the console frame's left edge inside a widened frame, 0 for every other target
 };
-
-// a draw's commands past its barriers and its target binding: recorded at once, or into a list of its own once a
-// pipeline still being made is done
-struct DrawCall {
-    D3D12_GPU_VIRTUAL_ADDRESS cb[2];  // b0 the vertex shader constants, b1 DrawConstants
-    D3D12_GPU_DESCRIPTOR_HANDLE views;
-    D3D12_GPU_DESCRIPTOR_HANDLE samplers;
-    D3D12_VIEWPORT viewport;
-    D3D12_RECT scissor;
-    float blend[4];
-    uint32_t stencil_ref;
-    D3D_PRIMITIVE_TOPOLOGY topology;
-    uint32_t vb_count;
-    D3D12_VERTEX_BUFFER_VIEW vbv[16];
-    uint32_t index_count;  // 0: draw_count vertices, unindexed
-    D3D12_INDEX_BUFFER_VIEW ibv;
-    int32_t base_vertex;
-    uint32_t draw_count;
-};
-
-// what a draw's vertex shader key is made from, compared whole against the draw before's
-struct VertexInputs {
-    uint64_t program;  // the program's hash, 0 for fixed function
-    uint64_t decode;
-    uint32_t vs_handle;
-    uint16_t regs;
-    uint8_t pretransformed;
-    uint8_t quad;
-    FixedKey fk;
-};
-
-// the bytes of a resource header Describe reads: Common, Data, Format and Size, all but Lock
-constexpr size_t kDescribedBytes = 16;
-void ReadDescribed(uint32_t header, uint8_t (&out)[kDescribedBytes]) {
-    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(header));
-    std::memcpy(out, p, 8);
-    std::memcpy(out + 8, p + 12, 8);
-}
-
-// what the depth copy probe reads: the surface drawn, its header and stage 0's header
-struct ProbeInputs {
-    Surface rt;
-    uint8_t rt_header[kDescribedBytes];
-    uint8_t tex_header[kDescribedBytes];
-};
-
-// the per draw fast paths, each an exact compare against what the draw before used, each with an opt out;
-// XBE_NO_DRAW_REUSE=1 turns all of them off: every draw then binds, writes, uploads and sets all it did before them
-struct Reuse {
-    bool stages = true;  // XBE_NO_STAGE_REUSE: a plain texture bound again as this frame's last bind of the stage did
-    bool views = true;   // XBE_NO_VIEW_REUSE: the draw before's descriptor table and sampler set
-    bool pso = true;     // XBE_NO_PSO_REUSE: the draw before's shaders and pipeline, SetPipelineState left out
-    bool consts = true;  // XBE_NO_CONST_REUSE: the draw before's constant uploads
-    bool binds = true;   // XBE_NO_BIND_GATE: the second target bind and the depth copy probe only when they can matter
-};
-
-// what the recording list has bound for draws, so a draw leaves out what is there already; anything else that
-// records into the list forgets it
-struct Bound {
-    ID3D12PipelineState* pso = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS cb[2] = {};
-    uint64_t table[2] = {};  // the views' and the samplers' GPU descriptor handles
-};
-
-constexpr uint32_t kCompileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL1;
-// the shader cache files' layout and what their keys hash: a change to either changes this
-constexpr uint32_t kCacheFormat = 1;
-constexpr uint64_t kCacheMaxBytes = 1ull << 30;  // a bigger file is not one of these: it starts over
-constexpr uint32_t kMaxShaderThreads = 32;
-
-// Compiled shaders and pipeline blobs kept beside the exe between runs, one append-only file each. A file starts with
-// what made its contents (magic, format, identity words); one whose header differs, from another format, compiler,
-// adapter or driver, is emptied and written again. Records follow as key, size, check and bytes; one cut short by a
-// crash or failing its check ends the file there. A second instance finds the file held and only reads it.
-class DiskCache {
-public:
-    ~DiskCache() {
-        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
-    }
-    void Open(const std::filesystem::path& path, const char (&magic)[9], const uint64_t* identity, uint32_t words);
-    bool On() const { return on_; }
-    size_t Loaded() const { return loaded_; }
-    // the bytes an earlier run stored under key, valid while the cache lives; false without them
-    bool Find(uint64_t key, const uint8_t*& p, size_t& n);
-    // replace: write it again over a record the driver turned down
-    void Put(uint64_t key, const void* p, size_t n, bool replace = false);
-
-private:
-    struct FileHead {
-        char magic[8];
-        uint32_t format;
-        uint32_t words;
-    };
-    struct RecordHead {
-        uint64_t key;
-        uint32_t size;
-        uint32_t check;  // low half of Hash(bytes, size, key)
-    };
-    struct Span {
-        const uint8_t* p;  // null: written this run, its maker keeps it
-        size_t n;
-    };
-    bool Write(const void* p, size_t n);
-    std::mutex m_;
-    HANDLE file_ = INVALID_HANDLE_VALUE;
-    bool on_ = false;
-    bool writable_ = false;
-    uint64_t end_ = 0;           // where the next record goes
-    std::vector<uint8_t> data_;  // the file as Open read it
-    std::unordered_map<uint64_t, Span> index_;
-    size_t loaded_ = 0;
-};
-
-void DiskCache::Open(const std::filesystem::path& path, const char (&magic)[9], const uint64_t* identity,
-                     uint32_t words) {
-    FileHead fh{};
-    std::memcpy(fh.magic, magic, sizeof(fh.magic));
-    fh.format = kCacheFormat;
-    fh.words = words;
-    std::vector<uint8_t> head(sizeof(fh) + size_t(words) * 8);
-    std::memcpy(head.data(), &fh, sizeof(fh));
-    std::memcpy(head.data() + sizeof(fh), identity, size_t(words) * 8);
-    file_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL, nullptr);
-    writable_ = file_ != INVALID_HANDLE_VALUE;
-    if (!writable_) {
-        file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
-    }
-    if (file_ == INVALID_HANDLE_VALUE) return;
-    on_ = true;
-    LARGE_INTEGER size{};
-    if (GetFileSizeEx(file_, &size) && size.QuadPart > 0 && uint64_t(size.QuadPart) <= kCacheMaxBytes) {
-        data_.resize(size_t(size.QuadPart));
-        DWORD got = 0;
-        if (!ReadFile(file_, data_.data(), DWORD(data_.size()), &got, nullptr) || got != data_.size()) data_.clear();
-    }
-    size_t at = 0;
-    if (data_.size() >= head.size() && !std::memcmp(data_.data(), head.data(), head.size())) {
-        at = head.size();
-        RecordHead r;
-        while (data_.size() - at >= sizeof(r)) {
-            std::memcpy(&r, data_.data() + at, sizeof(r));
-            const uint8_t* body = data_.data() + at + sizeof(r);
-            if (r.size > data_.size() - at - sizeof(r) || uint32_t(Hash(body, r.size, r.key)) != r.check) break;
-            index_[r.key] = {body, r.size};
-            at += sizeof(r) + r.size;
-        }
-    }
-    loaded_ = index_.size();
-    if (!writable_) return;
-    // what follows the last whole record goes; a file that did not match starts over under this run's header
-    end_ = at;
-    LARGE_INTEGER to{};
-    to.QuadPart = LONGLONG(at);
-    writable_ = SetFilePointerEx(file_, to, nullptr, FILE_BEGIN) && SetEndOfFile(file_);
-    if (writable_ && !at) writable_ = Write(head.data(), head.size());
-}
-
-bool DiskCache::Write(const void* p, size_t n) {
-    OVERLAPPED o{};
-    o.Offset = DWORD(end_);
-    o.OffsetHigh = DWORD(end_ >> 32);
-    DWORD wrote = 0;
-    if (!WriteFile(file_, p, DWORD(n), &wrote, &o) || wrote != n) return false;
-    end_ += n;
-    return true;
-}
-
-bool DiskCache::Find(uint64_t key, const uint8_t*& p, size_t& n) {
-    if (!on_) return false;
-    std::lock_guard lock(m_);
-    auto it = index_.find(key);
-    if (it == index_.end() || !it->second.p) return false;
-    p = it->second.p;
-    n = it->second.n;
-    return true;
-}
-
-void DiskCache::Put(uint64_t key, const void* p, size_t n, bool replace) {
-    if (!on_ || n > UINT32_MAX) return;
-    std::lock_guard lock(m_);
-    auto [it, fresh] = index_.try_emplace(key, Span{nullptr, 0});
-    if (!fresh && !replace) return;
-    it->second = {nullptr, 0};
-    if (!writable_) return;
-    std::vector<uint8_t> rec(sizeof(RecordHead) + n);
-    RecordHead r{key, uint32_t(n), uint32_t(Hash(p, n, key))};
-    std::memcpy(rec.data(), &r, sizeof(r));
-    std::memcpy(rec.data() + sizeof(r), p, n);
-    // a write that fails (a full disk) ends the writing; a record left short is cut off by the next Open
-    writable_ = Write(rec.data(), rec.size());
-}
-
-// The shader and pipeline makers. Jobs start in the order they were pushed, so a pipeline job only waits on shader
-// jobs that started before it and every wait ends. Without threads a job runs where it is pushed.
-class Workers {
-public:
-    ~Workers() {
-        {
-            std::lock_guard lock(m_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& t : threads_) t.join();
-    }
-    void SetThreads(uint32_t n) { want_ = n; }
-    uint32_t Threads() const { return want_; }
-    void Push(std::function<void()> job) {
-        if (!want_) {
-            // as on a worker: a job that throws must not take the thread down; its entry's guard sets done
-            try {
-                job();
-            } catch (...) {
-            }
-            return;
-        }
-        {
-            std::lock_guard lock(m_);
-            // started with the first job, not with the backend
-            for (uint32_t i = uint32_t(threads_.size()); i < want_; i++) threads_.emplace_back([this] { Run(); });
-            jobs_.push_back(std::move(job));
-        }
-        cv_.notify_one();
-    }
-
-private:
-    void Run() {
-        using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
-        if (auto set = reinterpret_cast<SetDescription>(
-                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
-            set(GetCurrentThread(), L"shaders");
-        // a burst of compiles on every spare core yields to the title, the render thread and the audio
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock lock(m_);
-                cv_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
-                if (stop_) return;
-                job = std::move(jobs_.front());
-                jobs_.pop_front();
-            }
-            // a job that throws (an allocation) must not take the thread down: its entry's guard sets done
-            try {
-                job();
-            } catch (...) {
-            }
-        }
-    }
-    uint32_t want_ = 0;
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::deque<std::function<void()>> jobs_;
-    std::vector<std::thread> threads_;
-    bool stop_ = false;
-};
-
-// every field of a pipeline description the driver builds from, with the shaders' bytecode and the root signature:
-// a stored blob only goes back with exactly the description it was made from
-uint64_t PipelineFingerprint(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, uint64_t root) {
-    uint32_t f[160];
-    uint32_t n = 0;
-    auto put = [&](uint32_t v) { f[n++] = v; };
-    auto putf = [&](float v) {
-        uint32_t u;
-        std::memcpy(&u, &v, 4);
-        put(u);
-    };
-    put(kCacheFormat);
-    const D3D12_BLEND_DESC& b = d.BlendState;
-    put(b.AlphaToCoverageEnable);
-    put(b.IndependentBlendEnable);
-    for (const D3D12_RENDER_TARGET_BLEND_DESC& r : b.RenderTarget) {
-        put(r.BlendEnable);
-        put(r.LogicOpEnable);
-        put(r.SrcBlend);
-        put(r.DestBlend);
-        put(r.BlendOp);
-        put(r.SrcBlendAlpha);
-        put(r.DestBlendAlpha);
-        put(r.BlendOpAlpha);
-        put(r.LogicOp);
-        put(r.RenderTargetWriteMask);
-    }
-    put(d.SampleMask);
-    const D3D12_RASTERIZER_DESC& rs = d.RasterizerState;
-    put(rs.FillMode);
-    put(rs.CullMode);
-    put(rs.FrontCounterClockwise);
-    put(uint32_t(rs.DepthBias));
-    putf(rs.DepthBiasClamp);
-    putf(rs.SlopeScaledDepthBias);
-    put(rs.DepthClipEnable);
-    put(rs.MultisampleEnable);
-    put(rs.AntialiasedLineEnable);
-    put(rs.ForcedSampleCount);
-    put(rs.ConservativeRaster);
-    const D3D12_DEPTH_STENCIL_DESC& ds = d.DepthStencilState;
-    put(ds.DepthEnable);
-    put(ds.DepthWriteMask);
-    put(ds.DepthFunc);
-    put(ds.StencilEnable);
-    put(ds.StencilReadMask);
-    put(ds.StencilWriteMask);
-    for (const D3D12_DEPTH_STENCILOP_DESC* face : {&ds.FrontFace, &ds.BackFace}) {
-        put(face->StencilFailOp);
-        put(face->StencilDepthFailOp);
-        put(face->StencilPassOp);
-        put(face->StencilFunc);
-    }
-    put(d.IBStripCutValue);
-    put(d.PrimitiveTopologyType);
-    put(d.NumRenderTargets);
-    for (DXGI_FORMAT r : d.RTVFormats) put(r);
-    put(d.DSVFormat);
-    put(d.SampleDesc.Count);
-    put(d.SampleDesc.Quality);
-    put(d.NodeMask);
-    put(d.Flags);
-    put(d.StreamOutput.NumEntries);
-    put(uint32_t(d.DS.BytecodeLength));
-    put(uint32_t(d.HS.BytecodeLength));
-    put(uint32_t(d.GS.BytecodeLength));
-    put(d.InputLayout.NumElements);
-    uint64_t h = Hash(f, n * sizeof(f[0]), root);
-    for (uint32_t i = 0; i < d.InputLayout.NumElements; i++) {
-        const D3D12_INPUT_ELEMENT_DESC& e = d.InputLayout.pInputElementDescs[i];
-        uint32_t el[6] = {e.SemanticIndex, uint32_t(e.Format), e.InputSlot, e.AlignedByteOffset,
-                          uint32_t(e.InputSlotClass), e.InstanceDataStepRate};
-        h = Hash(e.SemanticName, std::strlen(e.SemanticName), h);
-        h = Hash(el, sizeof(el), h);
-    }
-    h = Hash(d.VS.pShaderBytecode, d.VS.BytecodeLength, h);
-    return Hash(d.PS.pShaderBytecode, d.PS.BytecodeLength, h);
-}
-
-// the loaded HLSL compiler's build, from its PE header: its time stamp and image size, 0 when it is not loaded
-void CompilerIdentity(uint64_t& stamp, uint64_t& image) {
-    stamp = image = 0;
-    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(L"d3dcompiler_47.dll"));
-    if (!base) return;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    stamp = nt->FileHeader.TimeDateStamp;
-    image = nt->OptionalHeader.SizeOfImage;
-}
 
 class D3D12Backend final : public Backend, public Context {
 public:
@@ -837,10 +426,7 @@ public:
     ID3D12GraphicsCommandList* List() override { return cl_.Get(); }
     void Release(ComPtr<ID3D12Resource> r) override { CurrentFrame().garbage.push_back(std::move(r)); }
     D3D12_CPU_DESCRIPTOR_HANDLE View(const Target& t) override { return Cpu(rtv_heap_.Get(), t.view, rtv_inc_); }
-    void Unbind() override {
-        bound_rt_ = bound_ds_ = nullptr;
-        ForgetBindings();
-    }
+    void Unbind() override { bound_rt_ = bound_ds_ = nullptr; }
     void Capture(Target& t, const char* tag, float mul) override;
     float Scale() const override { return scale_; }
     void GuestSize(uint32_t& w, uint32_t& h) const override {
@@ -852,7 +438,6 @@ public:
 private:
     struct Frame {
         ComPtr<ID3D12CommandAllocator> alloc;
-        ComPtr<ID3D12CommandAllocator> defer_alloc;  // the lists of draws that waited for their pipelines
         ComPtr<ID3D12Resource> upload;
         uint8_t* map = nullptr;
         uint64_t used = 0;
@@ -865,20 +450,6 @@ private:
         uint64_t off;
         uint8_t* cpu;
         D3D12_GPU_VIRTUAL_ADDRESS gpu;
-    };
-    // a draw whose pipeline was still being made: its commands, and the targets it binds in a list of its own
-    struct DeferredDraw {
-        PipelineEntry* pipe;
-        DrawCall call;
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv;
-        bool rt;
-        bool ds;
-    };
-    // the frame's lists in execution order: a closed list, or a draw that becomes one when its pipeline is done
-    struct Pending {
-        ComPtr<ID3D12GraphicsCommandList> list;
-        std::unique_ptr<DeferredDraw> draw;
     };
 
     Alloc Upload(uint64_t size, uint64_t align = 256);
@@ -897,17 +468,7 @@ private:
     void Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D12_RESOURCE_STATES want) override;
     void Begin();
     void Submit(bool wait);
-    // the recording list's targets and viewport, remembered: a list begun after a submit starts with them again
-    void SetOm(const D3D12_CPU_DESCRIPTOR_HANDLE* rt, const D3D12_CPU_DESCRIPTOR_HANDLE* ds);
-    void SetOmViewport(const D3D12_VIEWPORT& vp, const D3D12_RECT& sc);
     void WaitFence(uint64_t value);
-    // a draw waiting for its pipeline: Defer splits the list around it, RunPending sends what can go, in order
-    void Defer(PipelineEntry& pipe, const DrawCall& dc);
-    void RunPending(bool wait);
-    ComPtr<ID3D12GraphicsCommandList> RecordDeferred(const DeferredDraw& d, ID3D12PipelineState* pso);
-    ComPtr<ID3D12GraphicsCommandList> NewList(ID3D12CommandAllocator* alloc);
-    void ForgetBindings() { bound_ = {}; }
-    void ForgetUploads();
     void SetFullViewport(uint32_t w, uint32_t h);
     void SetBlitTarget(D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h);
     void Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], bool gamma, bool alpha, uint32_t taps = 1,
@@ -920,9 +481,7 @@ private:
                         std::optional<uint32_t> sampler_slot = {});
     ID3D12Resource* Feedback(Target& t) override;
     void Resolve(Target& t) {
-        if (t.range == 1 || !ext_) return;
-        ext_->Resolve(*this, t);
-        ForgetBindings();
+        if (t.range != 1 && ext_) ext_->Resolve(*this, t);
     }
     // Pass, then its step
     void Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
@@ -931,16 +490,13 @@ private:
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend);
     // Draw, in call order, each callee right after its caller
     bool DepthCopy(const State& s);
-    bool FindDepthCopy(const State& s, Target*& src, Target*& dst);
     ID3D12PipelineState* EnsureDepthCopyPipeline();
     void DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso);
     bool AssembleDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
                       Assembled& a);
     bool BindTargets(const State& s);
-    void ResolveVertexShader(const State& s, const Assembled& a, DrawShaders& sh);
     void EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh);
     bool BindStageTexturesAndTargets(const State& s, DrawTextures& stages);
-    bool ReuseStage(const State& s, int i, DrawTextures& stages);
     ID3D12Resource* BindTexture(const State& s, int stage, DrawTextures& stages);
     ID3D12Resource* BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
                                       DrawTextures& stages);
@@ -950,29 +506,15 @@ private:
     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours,
                        bool same);
     void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
-    void RememberStage(const State& s, int i, const DrawTextures& stages);
-    bool TargetsMoved() const;
-    void ResolvePixelShader(const PixelKey& pk, DrawShaders& sh);
     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
-    PipelineEntry& ResolvePipeline(const PsoKey& k, const DrawShaders& sh);
-    PipelineEntry& EnsurePipeline(const PsoKey& k, ShaderEntry& vs, ShaderEntry& ps);
-    void MakePipeline(const PsoKey& k, ShaderEntry& vs, ShaderEntry& ps, PipelineEntry& e);
+    ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
-    ComPtr<ID3D12PipelineState> CreatePipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                         GuestExtent size, DrawConstants& c, DrawCall& dc);
+                         GuestExtent size, DrawConstants& c);
     void FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
-    // the bytes uploaded last for a constant buffer: the ring holds them until it starts over
-    template <typename T>
-    struct LastUpload {
-        D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;  // 0: nothing since the ring started over
-        T bytes;
-    };
-    template <typename T>
-    D3D12_GPU_VIRTUAL_ADDRESS UploadConstantBuffer(const T& v, LastUpload<T>& last, uint64_t& reused);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                      const DrawTextures& stages);
     void CaptureTextures(const State& s, const DrawTextures& stages);
@@ -980,18 +522,14 @@ private:
     void CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c);
     void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
-    void WriteTextureViews(const State& s, const Assembled& a, DrawTextures& stages, DrawCall& dc);
-    uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool reuse);
-    void FillViewportScissor(const State& s, GuestExtent size, DrawCall& dc) const;
-    void UploadGeometry(const Assembled& a, DrawCall& dc);
-    void RecordDraw(ID3D12GraphicsCommandList* l, ID3D12PipelineState* pso, const DrawCall& dc, Bound& b);
-    // shaders by content hash, made on the compile threads or here; Compile gives the bytecode of one needed at once
+    void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
+    uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
+    void SetViewportScissor(const State& s, GuestExtent size);
+    void SetBlendFactorStencilRef(const State& s);
+    void DrawGeometry(const Assembled& a);
+    void UploadVertexBuffers(const Assembled& a);
+    // shaders by source hash: Compile returns the bytecode and sets hash
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
-    ShaderEntry& RequestShader(std::string src, const char* entry, const char* profile, uint64_t& hash, bool now);
-    bool LoadShader(uint64_t hash, ShaderEntry& e);
-    void CompileShader(const std::string& src, const char* entry, const char* profile, uint64_t hash, ShaderEntry& e);
-    void Finish(std::atomic<bool>& done);
-    void WaitMade(const std::atomic<bool>& done);
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over = false);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
@@ -1002,11 +540,9 @@ private:
     uint32_t CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool visible, ComPtr<ID3D12DescriptorHeap>& out);
     void CreateBackBufferViews();
     bool CreateRootSignature();
-    void OpenShaderCache();
     void CreateFrames();
     void CreateGammaLut();
     void LoadSettings();
-    void LoadReuse();
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
     void StartCapture();
@@ -1016,11 +552,8 @@ private:
     void BlitFrame(Target& t);
     void RenderUi();
     void ReleaseOldTextures();
-    bool WithinBudget() const;
-    bool VideoMemory(DXGI_QUERY_VIDEO_MEMORY_INFO& mi) const;
     void ResetFrame();
     void CountFps();
-    void LogResidency();
     void ApplySettings();
     ComPtr<ID3D12Resource> Shrink(ID3D12Resource* src, D3D12_RESOURCE_STATES& st, DXGI_FORMAT fmt, uint32_t w,
                                   uint32_t h, const ShrinkOptions& o = {});
@@ -1053,7 +586,6 @@ private:
     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
     bool TargetStale(uint32_t data) const;
     void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it);
-    void TargetsChanged();
     // the main frame is drawn wider than the console's so an ultrawide display shows more world at the sides
     uint32_t WidenedGuestWidth() const;
     bool IsFrameTarget(const Target& t) const;
@@ -1118,87 +650,9 @@ private:
     std::vector<uint32_t> free_rtv_;
     std::vector<uint32_t> free_dsv_;
     ComPtr<ID3D12RootSignature> root_;
-    uint64_t root_hash_ = 0;  // of the serialized root signature, part of every pipeline's cache key
-    // shaders and pipelines: made on workers_, kept on disk between runs; entries stay put once made
-    struct ShaderRef {
-        uint64_t hash = 0;
-        ShaderEntry* entry = nullptr;
-    };
-    std::unordered_map<uint64_t, ShaderEntry> blobs_;     // by content hash
-    std::unordered_map<uint64_t, ShaderRef> shader_src_;  // vertex and pixel program keys to their shader
-    std::unordered_map<uint64_t, PipelineEntry> psos_;
-    DiskCache shader_disk_;
-    DiskCache pso_disk_;
-    std::mutex made_m_;  // Finish and WaitMade
-    std::condition_variable made_cv_;
-    bool defer_ = false;  // a draw whose pipeline is not made yet waits in a list of its own
-    std::deque<Pending> pending_;
-    std::vector<ComPtr<ID3D12GraphicsCommandList>> spare_lists_;  // executed, to record again
-    std::vector<ComPtr<ID3D12GraphicsCommandList>> run_lists_;
-    // the fast paths: their switches, what the list has bound, and what the draw before used
-    Reuse reuse_;
-    Bound bound_;
-    struct LastVertex {
-        ShaderEntry* entry = nullptr;
-        VertexInputs in;
-        uint64_t vkey;
-        uint64_t vh;
-    };
-    LastVertex last_vs_;
-    struct LastPixel {
-        ShaderEntry* entry = nullptr;
-        PixelKey pk;
-        uint64_t pkey;
-        uint64_t ph;
-    };
-    LastPixel last_ps_;
-    struct LastPipeline {
-        PipelineEntry* entry = nullptr;
-        PsoKey k;
-    };
-    LastPipeline last_pipe_;
-    LastUpload<std::array<std::array<float, 4>, 192>> last_vsc_;
-    LastUpload<DrawConstants> last_consts_;
-    std::array<std::array<float, 4>, 192> vsc_scratch_;  // the vertex registers as an extension adjusts them
-    // the draw before's descriptor table, until the ring starts over or wraps
-    struct ViewTable {
-        bool valid = false;
-        uint32_t slot = 0;
-        ID3D12Resource* res[4];
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv[4];
-    };
-    ViewTable views_;
-    // the draw before's sampler set, until the sampler heap starts over
-    struct SamplerSet {
-        bool valid = false;
-        uint32_t base = 0;
-        D3D12_SAMPLER_DESC sd[4];
-    };
-    SamplerSet samplers_last_;
-    // per stage, the last bind of a plain texture: the header bytes it was described from and what the bind gave
-    struct StageMemo {
-        bool valid = false;
-        uint64_t frame = 0;
-        uint64_t gen = 0;
-        uint8_t header[kDescribedBytes];
-        TexInfo info;
-        D3D12_SHADER_RESOURCE_VIEW_DESC sv;
-        ID3D12Resource* res;
-    };
-    StageMemo stage_memo_[4];
-    uint64_t bind_gen_ = 1;  // counts each texture or target made or dropped: what was remembered before is stale
-    uint32_t depth_targets_ = 0;
-    // the inputs of the last depth copy probe that found no copy
-    struct ProbeMemo {
-        bool valid = false;
-        uint64_t gen = 0;
-        ProbeInputs in;
-    };
-    ProbeMemo probe_;
-    // the device's adapter: the pipeline cache's identity and the video memory budget
-    ComPtr<IDXGIAdapter3> adapter_;
-    uint64_t tex_bytes_ = 0;    // video memory of the textures in textures_
-    bool vram_budget_ = true;   // XBE_NO_VRAM_BUDGET: textures swept on the fixed schedule whatever the budget
+    std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
+    std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
+    std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     std::unordered_map<uint64_t, uint32_t> samplers_;
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
@@ -1228,13 +682,6 @@ private:
     bool gamma_ = false;
     Target* bound_rt_ = nullptr;
     Target* bound_ds_ = nullptr;
-    // what SetOm and SetOmViewport last left on the recording list, for the next list Begin starts
-    D3D12_CPU_DESCRIPTOR_HANDLE om_rtv_{};
-    D3D12_CPU_DESCRIPTOR_HANDLE om_dsv_{};
-    bool om_rt_ = false;
-    bool om_ds_ = false;
-    D3D12_VIEWPORT om_vp_{};
-    D3D12_RECT om_sc_{};
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
     Target* draw_ds_ = nullptr;
     uint32_t guest_w_ = 640;
@@ -1265,8 +712,6 @@ private:
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
-    // last, so it stops before anything its jobs use goes
-    Workers workers_;
 };
 
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
@@ -1278,7 +723,6 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     CreateHeaps();
     CreateBackBufferViews();
     if (!CreateRootSignature()) return false;
-    OpenShaderCache();
     CreateFrames();
     CreateGammaLut();
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
@@ -1309,8 +753,6 @@ bool D3D12Backend::CreateDevice() {
     DXGI_ADAPTER_DESC1 ad{};
     if (adapter) adapter->GetDesc1(&ad);
     LOGR("D3D12 adapter: %ls", adapter ? ad.Description : L"default");
-    // the adapter the device runs on: the pipeline cache's identity and the video memory budget come from it
-    factory_->EnumAdapterByLuid(dev_->GetAdapterLuid(), IID_PPV_ARGS(&adapter_));
     D3D12_COMMAND_QUEUE_DESC qd{};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     dev_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
@@ -1397,50 +839,12 @@ bool D3D12Backend::CreateRootSignature() {
     ComPtr<ID3DBlob> err;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err))) return false;
     dev_->CreateRootSignature(0, rs->GetBufferPointer(), rs->GetBufferSize(), IID_PPV_ARGS(&root_));
-    root_hash_ = Hash(rs->GetBufferPointer(), rs->GetBufferSize());
     return true;
-}
-
-// The compile threads, and the shader cache beside the exe: shaders.bin holds bytecode by content hash, made by this
-// compiler with these flags; pipelines.bin holds the driver's pipeline blobs, keyed to the adapter (vendor, device,
-// subsystem, revision) and the driver version that made them - a blob handed to another adapter or driver is
-// turned down when it is used and made again without it (CreatePipeline), so both files survive a restart.
-void D3D12Backend::OpenShaderCache() {
-    // the title's and the render thread's cores stay theirs
-    uint32_t threads = std::max(std::thread::hardware_concurrency(), 3u) - 2;
-    if (const char* v = std::getenv("XBE_SHADER_THREADS"); v && *v) threads = uint32_t(std::strtoul(v, nullptr, 10));
-    workers_.SetThreads(std::min(threads, kMaxShaderThreads));
-    if (EnvOn("XBE_NO_SHADER_CACHE")) {
-        LOGI("d3d12: shader cache off (XBE_NO_SHADER_CACHE), %u compile threads", workers_.Threads());
-        return;
-    }
-    std::error_code ec;
-    std::filesystem::path dir = app::ExeDir() / "shadercache";
-    std::filesystem::create_directories(dir, ec);
-    uint64_t stamp;
-    uint64_t image;
-    CompilerIdentity(stamp, image);
-    const uint64_t compiler[] = {kCompileFlags, stamp, image};
-    shader_disk_.Open(dir / "shaders.bin", "XBESHADR", compiler, uint32_t(std::size(compiler)));
-    DXGI_ADAPTER_DESC1 ad{};
-    LARGE_INTEGER umd{};
-    if (adapter_) {
-        adapter_->GetDesc1(&ad);
-        // the user mode driver's version, which DXGI gives for the device interface
-        adapter_->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd);
-    }
-    const uint64_t device[] = {ad.VendorId, ad.DeviceId, ad.SubSysId, ad.Revision, uint64_t(umd.QuadPart)};
-    pso_disk_.Open(dir / "pipelines.bin", "XBEPIPES", device, uint32_t(std::size(device)));
-    LOGI("d3d12: shader cache %s: %zu shaders, %zu pipeline blobs (driver %u.%u.%u.%u); %u compile threads",
-         shader_disk_.On() ? "on" : "unavailable", shader_disk_.Loaded(), pso_disk_.Loaded(),
-         unsigned(HIWORD(umd.HighPart)), unsigned(LOWORD(umd.HighPart)), unsigned(HIWORD(umd.LowPart)),
-         unsigned(LOWORD(umd.LowPart)), workers_.Threads());
 }
 
 void D3D12Backend::CreateFrames() {
     for (auto& f : frames_) {
         dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.alloc));
-        dev_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.defer_alloc));
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC bd = BufferDesc(kUploadSize);
         dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
@@ -1464,72 +868,20 @@ void D3D12Backend::LoadSettings() {
     scale_ = app::RenderScale(guest_h_);
     widen_ = app::AspectWiden();
     ext_ = g_extension.get();
-    LoadReuse();
     if (ext_) {
         ext_->Settings();
         ext_->Reset(*this);
     }
 }
 
-// The fast paths' switches, read once. An extension's hooks run on every bind and may unbind the targets, so the
-// stage reuse and the bind gate stay off with one; a draw then also waits for its pipeline where it is, since an
-// extension may hold on to the list it was lent.
-void D3D12Backend::LoadReuse() {
-    bool all = !EnvOn("XBE_NO_DRAW_REUSE");
-    reuse_.stages = all && !EnvOn("XBE_NO_STAGE_REUSE") && !ext_;
-    reuse_.views = all && !EnvOn("XBE_NO_VIEW_REUSE");
-    reuse_.pso = all && !EnvOn("XBE_NO_PSO_REUSE");
-    reuse_.consts = all && !EnvOn("XBE_NO_CONST_REUSE");
-    reuse_.binds = all && !EnvOn("XBE_NO_BIND_GATE") && !ext_;
-    vram_budget_ = !EnvOn("XBE_NO_VRAM_BUDGET");
-    defer_ = workers_.Threads() && !ext_;
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
-    double budget = VideoMemory(mi) ? mi.Budget / 1048576.0 : -1;
-    LOGI("d3d12: draw reuse: stages %d views %d pipelines %d constants %d bind gate %d; a draw missing its pipeline %s; "
-         "local video memory budget %.0f MB, textures %s",
-         reuse_.stages, reuse_.views, reuse_.pso, reuse_.consts, reuse_.binds,
-         defer_ ? "waits in a list of its own" : "waits where it is", budget,
-         vram_budget_ ? "kept while it has room" : "swept on schedule (XBE_NO_VRAM_BUDGET)");
-}
-
 void D3D12Backend::Begin() {
-    // no list to begin on (its making failed, e.g. with the device removed): the frame's draws skip
-    // themselves against the same null list, a crash here would only hide the removal behind it
-    if (!cl_) return;
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
     bound_rt_ = bound_ds_ = nullptr;
-    ForgetBindings();
-    // a submit ends the list wherever the frame was: the new one starts with the targets and viewport it left
-    if (om_rt_ || om_ds_) {
-        cl_->OMSetRenderTargets(om_rt_ ? 1 : 0, om_rt_ ? &om_rtv_ : nullptr, FALSE, om_ds_ ? &om_dsv_ : nullptr);
-    }
-    if (om_vp_.Width != 0) {
-        cl_->RSSetViewports(1, &om_vp_);
-        cl_->RSSetScissorRects(1, &om_sc_);
-    }
-}
-
-void D3D12Backend::SetOm(const D3D12_CPU_DESCRIPTOR_HANDLE* rt, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
-    cl_->OMSetRenderTargets(rt ? 1 : 0, rt, FALSE, ds);
-    om_rt_ = rt != nullptr;
-    om_ds_ = ds != nullptr;
-    if (rt) om_rtv_ = *rt;
-    if (ds) om_dsv_ = *ds;
-}
-
-void D3D12Backend::SetOmViewport(const D3D12_VIEWPORT& vp, const D3D12_RECT& sc) {
-    cl_->RSSetViewports(1, &vp);
-    cl_->RSSetScissorRects(1, &sc);
-    om_vp_ = vp;
-    om_sc_ = sc;
 }
 
 void D3D12Backend::Submit(bool wait) {
-    // draws still waiting for their pipelines go first, in order: the frame cannot go without them
-    RunPending(true);
-    if (!cl_) return;
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
     queue_->ExecuteCommandLists(1, lists);
@@ -1539,11 +891,9 @@ void D3D12Backend::Submit(bool wait) {
     if (wait) {
         WaitFence(fence_value_);
         f.alloc->Reset();
-        f.defer_alloc->Reset();
         f.garbage.clear();
         f.used = 0;
         f.srv = 0;
-        ForgetUploads();
         cl_->Reset(f.alloc.Get(), nullptr);
         Begin();
     }
@@ -1556,97 +906,16 @@ void D3D12Backend::WaitFence(uint64_t value) {
     WaitForSingleObject(event_, INFINITE);
 }
 
-// The list so far goes to the GPU, the draw waits in a list of its own until its pipeline is made, and the draws
-// after it record into a new list that runs after that one: the GPU still takes every draw in order, each with its
-// own pipeline, while the pipelines the frame lacks are made side by side on the compile threads.
-void D3D12Backend::Defer(PipelineEntry& pipe, const DrawCall& dc) {
-    g_perf.deferred++;
-    auto d = std::make_unique<DeferredDraw>();
-    d->pipe = &pipe;
-    std::memcpy(&d->call, &dc, sizeof(dc));
-    d->rt = bound_rt_ != nullptr;
-    d->ds = bound_ds_ != nullptr;
-    d->rtv = d->rt ? Cpu(rtv_heap_.Get(), bound_rt_->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-    d->dsv = d->ds ? Cpu(dsv_heap_.Get(), bound_ds_->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-    cl_->Close();
-    pending_.push_back({std::move(cl_), nullptr});
-    pending_.push_back({nullptr, std::move(d)});
-    cl_ = NewList(CurrentFrame().alloc.Get());
-    Begin();
-    RunPending(false);
-}
-
-// the lists at the front of pending_ that can run go to the GPU, a draw whose pipeline is made recorded first;
-// wait: every pipeline is waited for, so all of them go
-void D3D12Backend::RunPending(bool wait) {
-    while (!pending_.empty()) {
-        Pending& p = pending_.front();
-        if (p.draw) {
-            PipelineEntry& pipe = *p.draw->pipe;
-            if (!pipe.done.load(std::memory_order_acquire)) {
-                if (!wait) break;
-                PerfScope perf_stall{g_perf.compile};
-                WaitMade(pipe.done);
-            }
-            // a pipeline that could not be made draws nothing, as such a draw always did
-            if (pipe.pso) p.list = RecordDeferred(*p.draw, pipe.pso.Get());
-        }
-        if (p.list) run_lists_.push_back(std::move(p.list));
-        pending_.pop_front();
-    }
-    ID3D12CommandList* lists[16];
-    for (size_t i = 0; i < run_lists_.size(); i += std::size(lists)) {
-        UINT n = UINT(std::min(std::size(lists), run_lists_.size() - i));
-        for (UINT j = 0; j < n; j++) lists[j] = run_lists_[i + j].Get();
-        queue_->ExecuteCommandLists(n, lists);
-    }
-    // executed lists can record again at once, into an allocator no other list is recording into
-    for (auto& l : run_lists_) spare_lists_.push_back(std::move(l));
-    run_lists_.clear();
-}
-
-// a waiting draw's list: the heaps, root signature and targets a new list lacks, then the draw
-ComPtr<ID3D12GraphicsCommandList> D3D12Backend::RecordDeferred(const DeferredDraw& d, ID3D12PipelineState* pso) {
-    ComPtr<ID3D12GraphicsCommandList> l = NewList(CurrentFrame().defer_alloc.Get());
-    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
-    l->SetDescriptorHeaps(2, heaps);
-    l->SetGraphicsRootSignature(root_.Get());
-    l->OMSetRenderTargets(d.rt ? 1 : 0, d.rt ? &d.rtv : nullptr, FALSE, d.ds ? &d.dsv : nullptr);
-    Bound fresh;
-    RecordDraw(l.Get(), pso, d.call, fresh);
-    l->Close();
-    return l;
-}
-
-// a list recording into alloc: an executed one again, else a new one
-ComPtr<ID3D12GraphicsCommandList> D3D12Backend::NewList(ID3D12CommandAllocator* alloc) {
-    ComPtr<ID3D12GraphicsCommandList> l;
-    if (spare_lists_.empty()) {
-        dev_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&l));
-    } else {
-        l = std::move(spare_lists_.back());
-        spare_lists_.pop_back();
-        l->Reset(alloc, nullptr);
-    }
-    return l;
-}
-
-// the frame's ring starts over: the constants and views remembered in it are gone
-void D3D12Backend::ForgetUploads() {
-    last_vsc_.gpu = 0;
-    last_consts_.gpu = 0;
-    views_.valid = false;
-}
-
 void D3D12Backend::SetFullViewport(uint32_t w, uint32_t h) {
     D3D12_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
     D3D12_RECT scissor{0, 0, LONG(w), LONG(h)};
-    SetOmViewport(vp, scissor);
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
 }
 
 // one w x h colour target for a Blit, the draw's bound targets forgotten
 void D3D12Backend::SetBlitTarget(D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t w, uint32_t h) {
-    SetOm(&rtv, nullptr);
+    cl_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     SetFullViewport(w, h);
 }
@@ -1674,14 +943,12 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
 }
 
 uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
-    const uint32_t per = kSrvCount / kFrames;
-    if (CurrentFrame().srv + n > per) {
-        // views are read when the GPU gets to them, not when they are written, and draws may already be on their
-        // way: the frame ends here, so nothing recorded or waiting samples a slot this frame writes over
-        LOG_FIRST(4, "d3d12: descriptor ring filled within a frame, submitting it");
-        Submit(true);
-    }
     Frame& f = CurrentFrame();
+    const uint32_t per = kSrvCount / kFrames;
+    if (f.srv + n > per) {
+        LOG_FIRST(4, "d3d12: descriptor ring wrapped within a frame");
+        f.srv = 0;
+    }
     uint32_t i = uint32_t(frame_ % kFrames) * per + f.srv;
     f.srv += n;
     return i;
@@ -1701,21 +968,11 @@ void D3D12Backend::Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES& cur, D3D
 
 // a resized target gives back its view and its resources
 void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it) {
-    // a draw waiting for its pipeline binds its targets' views when it is recorded: it is, before a view goes
-    if (!pending_.empty()) RunPending(true);
     if (bound_rt_ == &it->second || bound_ds_ == &it->second) bound_rt_ = bound_ds_ = nullptr;
     (it->second.depth ? free_dsv_ : free_rtv_).push_back(it->second.view);
     CurrentFrame().garbage.push_back(it->second.res);
     if (it->second.fb) CurrentFrame().garbage.push_back(it->second.fb);
     targets_.erase(it);
-    TargetsChanged();
-}
-
-// targets_ gained or lost an entry: what the stages and the depth copy probe remembered of it is stale
-void D3D12Backend::TargetsChanged() {
-    bind_gen_++;
-    depth_targets_ = 0;
-    for (const auto& [key, t] : targets_) depth_targets_ += t.depth;
 }
 
 // the console's frame drawn wider so an ultrawide display shows more world; every other target keeps its size,
@@ -1840,7 +1097,6 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.gw = slot.gw;
     t.gh = slot.gh;
     if (!CreateTargetResource(t, s)) return nullptr;
-
     g_perf.targets++;
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
@@ -1850,7 +1106,6 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
     auto& ref = targets_[slot.key] = std::move(t);
-    TargetsChanged();
     return &ref;
 }
 
@@ -1871,7 +1126,7 @@ bool D3D12Backend::BindTargets(const State& s) {
     if (rt != bound_rt_ || ds != bound_ds_) {
         D3D12_CPU_DESCRIPTOR_HANDLE rh = rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
         D3D12_CPU_DESCRIPTOR_HANDLE dh = ds ? Cpu(dsv_heap_.Get(), ds->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-        SetOm(rt ? &rh : nullptr, ds ? &dh : nullptr);
+        cl_->OMSetRenderTargets(rt ? 1 : 0, rt ? &rh : nullptr, FALSE, ds ? &dh : nullptr);
         bound_rt_ = rt;
         bound_ds_ = ds;
     }
@@ -1902,7 +1157,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
     p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     p.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     p.SampleDesc.Count = 1;
-    pso = CreatePipeline(p);
+    if (FAILED(dev_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
 
@@ -1912,10 +1167,8 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), dst.view, dsv_inc_);
-    SetOm(nullptr, &dh);
+    cl_->OMSetRenderTargets(0, nullptr, FALSE, &dh);
     SetFullViewport(dst.w, dst.h);
-    // the blit samplers before the view takes a slot and the constants a ring address a full sampler heap frees
-    uint32_t samplers = EnsureBlitSamplers();
     uint32_t slot = AllocSrvSlots(1);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -1924,49 +1177,29 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     sv.Texture2D.MipLevels = 1;
     dev_->CreateShaderResourceView(src.res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     Alloc cb = Upload(256, 256);
-    DrawFullScreen(pso, cb.gpu, slot, samplers);
+    DrawFullScreen(pso, cb.gpu, slot);
     dst.drawn = true;
     bound_rt_ = bound_ds_ = nullptr;
 }
 
-// A depth buffer drawn as colour into another depth buffer's memory: copied as depth. A copy needs two depth targets,
-// the surface drawn and the one sampled; the inputs of a probe that found none, with no target made or dropped since,
-// find none again.
+// a depth buffer drawn as colour into another depth buffer's memory: copied as depth
 bool D3D12Backend::DepthCopy(const State& s) {
-    if (!s.rt.header || !s.textures[0]) return false;
-    ProbeInputs in;
-    if (reuse_.binds) {
-        if (depth_targets_ < 2) return false;
-        in.rt = s.rt;
-        ReadDescribed(s.rt.header, in.rt_header);
-        ReadDescribed(s.textures[0], in.tex_header);
-        if (probe_.valid && probe_.gen == bind_gen_ && !std::memcmp(&probe_.in, &in, sizeof(in))) return false;
-    }
-    g_perf.probes++;
-    Target* src;
-    Target* dst;
-    if (!FindDepthCopy(s, src, dst)) {
-        if (reuse_.binds) probe_ = {true, bind_gen_, in};
+    TextureDesc d;
+    if (!s.rt.header || !s.textures[0] || !Describe(s.textures[0], d) || Format(d.format).depth || d.cube ||
+        d.depth != 1) {
         return false;
     }
-    ID3D12PipelineState* pso = EnsureDepthCopyPipeline();
-    if (!pso) return false;
-    DrawDepthCopy(*src, *dst, pso);
-    return true;
-}
-
-// the depth targets of stage 0's texture and of the surface drawn, when they are two
-bool D3D12Backend::FindDepthCopy(const State& s, Target*& src, Target*& dst) {
-    TextureDesc d;
-    if (!Describe(s.textures[0], d) || Format(d.format).depth || d.cube || d.depth != 1) return false;
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(s.rt, gw, gh);
     auto di = targets_.find(SizedTargetKey(mem::VirtualFromPhysical(s.rt.data), true, gw, gh));
     auto si = targets_.find(SizedTargetKey(d.data, true, d.width, d.height));
     if (di == targets_.end() || si == targets_.end() || di == si) return false;
-    dst = &di->second;
-    src = &si->second;
+    Target& dst = di->second;
+    Target& src = si->second;
+    ID3D12PipelineState* pso = EnsureDepthCopyPipeline();
+    if (!pso) return false;
+    DrawDepthCopy(src, dst, pso);
     return true;
 }
 
@@ -2012,7 +1245,6 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
 // CPU pixels of a color surface into its host target, scaled
 void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
     g_perf.rtups++;
-
     TextureDesc d;
     if (!Describe(s.header, d) || Format(d.format).depth) return;
     std::vector<uint8_t> px;
@@ -2047,11 +1279,8 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
     uint32_t si;
     if (it == samplers_.end()) {
         if (smp_used_ + 4 > kSamplerCount) {
-            // samplers are read when the GPU gets to them, not when they are written: the frame ends here
-            Submit(true);
             samplers_.clear();
             smp_used_ = 0;
-            samplers_last_.valid = false;
         }
         si = smp_used_;
         smp_used_ += 4;
@@ -2072,21 +1301,18 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
 // the full screen triangle: cb at b0 and b1, views at srv_slot; without a sampler slot EnsureBlitSamplers gives it
 void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                                   std::optional<uint32_t> sampler_slot) {
-    ForgetBindings();
-    // without a slot the passes take the blit samplers; looked up first, as a full sampler heap ends the list
-    uint32_t si = sampler_slot ? *sampler_slot : EnsureBlitSamplers();
     cl_->SetPipelineState(pso);
     cl_->SetGraphicsRootConstantBufferView(0, cb);
     cl_->SetGraphicsRootConstantBufferView(1, cb);
     cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), srv_slot, srv_inc_));
+    // without a slot the passes take the blit samplers, looked up at this point as they always were
+    uint32_t si = sampler_slot ? *sampler_slot : EnsureBlitSamplers();
     cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), si, smp_inc_));
     cl_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cl_->DrawInstanced(3, 1, 0, 0);
 }
 
 void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect[4], const BlitOptions& o) {
-    // the blit samplers before the views take slots and the constants a ring address a full sampler heap frees
-    uint32_t si = EnsureBlitSamplers();
     uint32_t slot = AllocSrvSlots(2);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fmt;
@@ -2096,6 +1322,7 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(src, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     sv.Format = kBgra;
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
+    uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
     float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                   o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul};
@@ -2103,104 +1330,27 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
 }
 
-// a shader the render thread needs at once (the full screen passes): from memory or the disk cache, else compiled
-// here; one still compiling on a worker is waited for
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    ShaderEntry& e = RequestShader(src, entry, profile, hash, true);
-    if (!e.done.load(std::memory_order_acquire)) {
-        PerfScope perf_stall{g_perf.compile};
-        WaitMade(e.done);
-    }
-    return e.code.Get();
-}
-
-// The shader of a source, entry and profile, by content hash. A miss reads the disk cache, else compiles: here when
-// now is set or there are no compile threads, else on one of them; the entry is done once it is.
-ShaderEntry& D3D12Backend::RequestShader(std::string src, const char* entry, const char* profile, uint64_t& hash,
-                                         bool now) {
     // one source can hold several entry points
     uint64_t profile_seed = Hash(profile, std::strlen(profile));
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(src.data(), src.size(), entry_seed);
-    auto [it, made] = blobs_.try_emplace(hash);
-    ShaderEntry& e = it->second;
-    if (!made || LoadShader(hash, e)) return e;
-    g_perf.shaders++;
-    if (now || !workers_.Threads()) {
-        PerfScope perf_compile{g_perf.compile};
-        CompileShader(src, entry, profile, hash, e);
-    } else {
-        workers_.Push([this, src = std::move(src), entry, profile, hash, &e] {
-            CompileShader(src, entry, profile, hash, e);
-        });
-    }
-    return e;
-}
-
-// a shader an earlier run compiled
-bool D3D12Backend::LoadShader(uint64_t hash, ShaderEntry& e) {
-    const uint8_t* p;
-    size_t n;
-    if (!shader_disk_.Find(hash, p, n)) return false;
-    // a record that is not the bytecode it keys (a torn or foreign write): not DXBC, or not the size its
-    // header at offset 24 says; compiling it again replaces it below
-    uint32_t total = 0;
-    if (n >= 32) std::memcpy(&total, p + 24, 4);
-    if (n < 32 || std::memcmp(p, "DXBC", 4) || total != n) {
-        LOG_FIRST(4, "d3d12: shader cache record %llX is not DXBC, compiling it again",
-                  (unsigned long long)hash);
-        return false;
-    }
-    ComPtr<ID3DBlob> code;
-    if (FAILED(D3DCreateBlob(n, &code))) return false;
-    std::memcpy(code->GetBufferPointer(), p, n);
-    e.code = std::move(code);
-    // nothing waits on an entry made this moment: no wake up needed
-    e.done.store(true, std::memory_order_release);
-    g_made.disk_shaders++;
-    return true;
-}
-
-// D3DCompile on whichever thread runs it; the bytecode goes to the disk cache
-void D3D12Backend::CompileShader(const std::string& src, const char* entry, const char* profile, uint64_t hash,
-                                 ShaderEntry& e) {
-    // done is set on the way out whatever happens: a draw waits on it
-    struct SetDone {
-        D3D12Backend& b;
-        ShaderEntry& e;
-        ~SetDone() { b.Finish(e.done); }
-    } set_done{*this, e};
-    auto t = PerfClock::now();
+    auto it = blobs_.find(hash);
+    if (it != blobs_.end()) return it->second.Get();
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
-    HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile, kCompileFlags, 0,
-                            &code, &err);
-    g_made.compile_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t).count());
-    g_made.compiled++;
+    PerfScope perf_compile{g_perf.compile};
+    g_perf.shaders++;
+    HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
+                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
     if (FAILED(hr)) {
         LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         LOGE("%s", src.c_str());
-        code = nullptr;
-    } else {
-        // replace: over a record LoadShader turned down as not DXBC
-        shader_disk_.Put(hash, code->GetBufferPointer(), code->GetBufferSize(), true);
+        blobs_[hash] = nullptr;
+        return nullptr;
     }
-    e.code = std::move(code);
-}
-
-// an entry's result is in: whoever waits for one wakes
-void D3D12Backend::Finish(std::atomic<bool>& done) {
-    {
-        std::lock_guard lock(made_m_);
-        done.store(true, std::memory_order_release);
-    }
-    made_cv_.notify_all();
-}
-
-void D3D12Backend::WaitMade(const std::atomic<bool>& done) {
-    if (done.load(std::memory_order_acquire)) return;
-    std::unique_lock lock(made_m_);
-    made_cv_.wait(lock, [&] { return done.load(std::memory_order_acquire); });
+    blobs_[hash] = code;
+    return code.Get();
 }
 
 // a full screen pass's pipeline: solid, no culling, one target, writing all channels; callers set the blend
@@ -2239,7 +1389,7 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
         blend.DestBlendAlpha = D3D12_BLEND_ONE;
         blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
-    pso = CreatePipeline(d);
+    dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
     return pso.Get();
 }
 
@@ -2262,7 +1412,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
         b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
         b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
-    pso = CreatePipeline(d);
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
 
@@ -2271,9 +1421,6 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
                         const float p[8], float blend) {
     ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend);
     if (!pso) return;
-    // the blit samplers first: a full sampler heap ends the list there, before the constants take a ring address
-    // and before the targets, viewport and blend factor below are recorded into it
-    uint32_t samplers = EnsureBlitSamplers();
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -2285,13 +1432,13 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
     }
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, p, 8 * sizeof(float));
-    SetOm(&rh, nullptr);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     SetFullViewport(w, h);
     if (blend >= 0) {
         float f[4] = {blend, blend, blend, blend};
         cl_->OMSetBlendFactor(f);
     }
-    DrawFullScreen(pso, cb.gpu, slot, samplers);
+    DrawFullScreen(pso, cb.gpu, slot);
     bound_rt_ = bound_ds_ = nullptr;
 }
 
@@ -2378,111 +1525,20 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.SampleDesc.Count = 1;
 }
 
-// the draw before's pipeline when the key is the same bytes, else EnsurePipeline's
-PipelineEntry& D3D12Backend::ResolvePipeline(const PsoKey& k, const DrawShaders& sh) {
-    if (reuse_.pso && last_pipe_.entry && !std::memcmp(&k, &last_pipe_.k, sizeof(k))) {
-        g_perf.pso_reuse++;
-        return *last_pipe_.entry;
-    }
-    PipelineEntry& e = EnsurePipeline(k, *sh.vs, *sh.ps);
-    if (reuse_.pso) {
-        last_pipe_.entry = &e;
-        std::memcpy(&last_pipe_.k, &k, sizeof(k));
-    }
-    return e;
-}
-
-// the pipeline by key; a new one is made on a compile thread once its shaders are, or here without threads
-PipelineEntry& D3D12Backend::EnsurePipeline(const PsoKey& k, ShaderEntry& vs, ShaderEntry& ps) {
-    auto [it, made] = psos_.try_emplace(Hash(&k, sizeof(k)));
-    PipelineEntry& e = it->second;
-    if (!made) return e;
-    g_perf.psos++;
-    // jobs start in the order pushed: the shaders' jobs, when they have any, started before this one
-    workers_.Push([this, k, &vs, &ps, &e] { MakePipeline(k, vs, ps, e); });
-    return e;
-}
-
-// on whichever thread runs it
-void D3D12Backend::MakePipeline(const PsoKey& k, ShaderEntry& vs, ShaderEntry& ps, PipelineEntry& e) {
-    // done is set on the way out whatever happens: a draw waits on it
-    struct SetDone {
-        D3D12Backend& b;
-        PipelineEntry& e;
-        ~SetDone() { b.Finish(e.done); }
-    } set_done{*this, e};
-    WaitMade(vs.done);
-    WaitMade(ps.done);
-    // a shader that failed to compile leaves the pipeline null, and its draws draw nothing
-    if (vs.code && ps.code) {
-        D3D12_INPUT_ELEMENT_DESC el[16];
-        uint32_t n = FillInputLayout(k, el);
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
-        d.InputLayout = {el, n};
-        FillPipelineDesc(k, vs.code.Get(), ps.code.Get(), d);
-        e.pso = CreatePipeline(d);
-        if (!e.pso)
-            LOGE("d3d12: pipeline creation failed vs=%llX ps=%llX regs=%X topo=%u rt=%u ds=%u rtfmt=%u ninput=%u",
-                 (unsigned long long)k.vs, (unsigned long long)k.ps, k.regs, k.topo, k.has_rt, k.has_ds, k.rtfmt, n);
-    }
-}
-
-// A pipeline from its description through the disk cache: a blob an earlier run stored for exactly this description
-// goes back to the driver, which may turn it down (another driver or adapter): then it is made again without, and the
-// new blob replaces the old. Null when the pipeline cannot be made. Any thread.
-ComPtr<ID3D12PipelineState> D3D12Backend::CreatePipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
+    uint64_t h = Hash(&k, sizeof(k));
+    auto it = psos_.find(h);
+    if (it != psos_.end()) return it->second.Get();
+    D3D12_INPUT_ELEMENT_DESC el[16];
+    uint32_t n = FillInputLayout(k, el);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.InputLayout = {el, n};
+    FillPipelineDesc(k, vs, ps, d);
     ComPtr<ID3D12PipelineState> pso;
-    uint64_t key = pso_disk_.On() ? PipelineFingerprint(d, root_hash_) : 0;
-    const uint8_t* blob;
-    size_t n;
-    bool refused = false;
-    if (key && pso_disk_.Find(key, blob, n)) {
-        d.CachedPSO = {blob, n};
-        HRESULT hr = dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
-        d.CachedPSO = {};
-        if (SUCCEEDED(hr)) {
-            g_made.disk_psos++;
-            return pso;
-        }
-        pso = nullptr;
-        refused = true;
-        g_made.refused++;
-        LOGE("d3d12: cached pipeline blob refused hr=%08lX key=%llX", (unsigned long)hr, (unsigned long long)key);
-    }
-    g_made.psos++;
-    HRESULT hr = dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
-    if (FAILED(hr)) {
-        LOGE("d3d12: CreateGraphicsPipelineState failed hr=%08lX removed=%08lX key=%llX topo=%u nrt=%u rtv=%u dsv=%u "
-             "ninput=%u vs=%zu ps=%zu blend=%u src=%u dst=%u wmask=%u zen=%u zfunc=%u sten=%u fill=%u cull=%u",
-             (unsigned long)hr, (unsigned long)dev_->GetDeviceRemovedReason(), (unsigned long long)key,
-             unsigned(d.PrimitiveTopologyType), d.NumRenderTargets, unsigned(d.RTVFormats[0]), unsigned(d.DSVFormat),
-             d.InputLayout.NumElements, d.VS.BytecodeLength, d.PS.BytecodeLength,
-             unsigned(d.BlendState.RenderTarget[0].BlendEnable), unsigned(d.BlendState.RenderTarget[0].SrcBlend),
-             unsigned(d.BlendState.RenderTarget[0].DestBlend), unsigned(d.BlendState.RenderTarget[0].RenderTargetWriteMask),
-             unsigned(d.DepthStencilState.DepthEnable), unsigned(d.DepthStencilState.DepthFunc),
-             unsigned(d.DepthStencilState.StencilEnable), unsigned(d.RasterizerState.FillMode),
-             unsigned(d.RasterizerState.CullMode));
-        // with the debug layer (XBE_D3D12_DEBUG) its stored messages name the field the driver refused
-        ComPtr<ID3D12InfoQueue> iq;
-        if (SUCCEEDED(dev_.As(&iq))) {
-            uint64_t m = iq->GetNumStoredMessages();
-            for (uint64_t i = 0; i < m; i++) {
-                SIZE_T len = 0;
-                if (FAILED(iq->GetMessage(i, nullptr, &len)) || !len) continue;
-                std::vector<std::byte> buf(len);
-                auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                if (SUCCEEDED(iq->GetMessage(i, msg, &len)))
-                    LOGE("d3d12:   layer: %s", msg->pDescription);
-            }
-            iq->ClearStoredMessages();
-        }
-        return nullptr;
-    }
-    ComPtr<ID3DBlob> cached;
-    if (key && SUCCEEDED(pso->GetCachedBlob(&cached)) && cached) {
-        pso_disk_.Put(key, cached->GetBufferPointer(), cached->GetBufferSize(), refused);
-    }
-    return pso;
+    g_perf.psos++;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
+    psos_[h] = pso;
+    return pso.Get();
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -2531,9 +1587,6 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
 // false when the texture could not be made, its entry dropped
 bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key) {
     g_perf.newtex++;
-    // a stage that remembers this entry's old resource binds it again
-    bind_gen_++;
-    tex_bytes_ -= tx.bytes;
     if (tx.res) CurrentFrame().garbage.push_back(tx.res);
     tx = Tex{};
     tx.d = d;
@@ -2561,8 +1614,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
         textures_.erase(key);
         return false;
     }
-    tx.bytes = dev_->GetResourceAllocationInfo(0, 1, &td).SizeInBytes;
-    tex_bytes_ += tx.bytes;
     return true;
 }
 
@@ -2640,6 +1691,7 @@ struct StagePalette {
 
 // a P8 texture is decoded with the stage's palette: 256 colours, fewer by the size code in the top two bits
 void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePalette& palette) {
+    constexpr uint32_t kFmtP8 = 0x0B;          // D3DFMT_P8
     constexpr uint32_t kPaletteCommon = 0;     // D3DPalette: Common, its top two bits the size code
     constexpr uint32_t kPaletteData = 4;       // D3DPalette: Data, physical address of the colours
     constexpr uint32_t kPaletteSizeShift = 30;
@@ -2656,7 +1708,6 @@ void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePale
 ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                                DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
-    stages.pal[stage] = d.format == kFmtP8;
     StagePalette palette;
     ReadStagePalette(s, stage, d, palette);
     const uint64_t key = uint64_t(palette.va) << 32 | d.data;
@@ -2669,11 +1720,9 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
         tx.frame = presents_ + 1;
         tx.palette = palette.hash;
         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-        uint64_t sig;
-        {
-            PerfScope perf_sig{g_perf.sig};
-            sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
-        }
+        auto perf_t = PerfClock::now();
+        uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
+        g_perf.sig += PerfMs(perf_t);
         if (sig != tx.sig || !same) {
             PerfScope perf_up{g_perf.texup};
             g_perf.texups++;
@@ -2692,10 +1741,8 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
     info = {};
-    // padding too: the views are compared as bytes
-    std::memset(&sv, 0, sizeof(sv));
+    sv = {};
     stages.rt[stage] = false;
-    stages.pal[stage] = false;
     stages.k[stage] = 1;
     stages.wide[stage] = 0;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2764,36 +1811,21 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     return sd;
 }
 
-// the stages' samplers; reuse: the draw before's set when the descriptions are the same bytes
-uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool reuse) {
+uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp) {
     D3D12_SAMPLER_DESC sd[4];
     uint32_t aniso = app::Get().aniso;
     for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, aniso);
-    if (reuse && samplers_last_.valid && !std::memcmp(samplers_last_.sd, sd, sizeof(sd))) {
-        g_perf.sampler_reuse++;
-        return samplers_last_.base;
-    }
     uint64_t key = Hash(sd, sizeof(sd));
-    uint32_t base;
     auto it = samplers_.find(key);
-    if (it != samplers_.end()) {
-        base = it->second;
-    } else {
-        if (smp_used_ + 4 > kSamplerCount) {
-            // as in EnsureBlitSamplers: no recorded or waiting draw samples a slot written over
-            Submit(true);
-            samplers_.clear();
-            smp_used_ = 0;
-            samplers_last_.valid = false;
-        }
-        base = smp_used_;
-        smp_used_ += 4;
-        for (int i = 0; i < 4; i++) dev_->CreateSampler(&sd[i], Cpu(smp_heap_.Get(), base + i, smp_inc_));
-        samplers_[key] = base;
+    if (it != samplers_.end()) return it->second;
+    if (smp_used_ + 4 > kSamplerCount) {
+        samplers_.clear();
+        smp_used_ = 0;
     }
-    samplers_last_.valid = reuse;
-    samplers_last_.base = base;
-    std::memcpy(samplers_last_.sd, sd, sizeof(sd));
+    uint32_t base = smp_used_;
+    smp_used_ += 4;
+    for (int i = 0; i < 4; i++) dev_->CreateSampler(&sd[i], Cpu(smp_heap_.Get(), base + i, smp_inc_));
+    samplers_[key] = base;
     return base;
 }
 
@@ -2838,139 +1870,42 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
 
-// the draw before's vertex shader when what its key is made from is the same bytes, else EnsureVertexShader's
-void D3D12Backend::ResolveVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
-    VertexInputs in;
-    std::memset(&in, 0, sizeof(in));
-    in.program = sh.prog ? s.vs->hash : 0;
-    in.decode = a.decode;
-    in.vs_handle = s.vs_handle;
-    in.regs = a.regs;
-    in.pretransformed = a.pretransformed;
-    in.quad = sh.quad;
-    in.fk = sh.fk;
-    if (reuse_.pso && last_vs_.entry && !std::memcmp(&in, &last_vs_.in, sizeof(in))) {
-        sh.vkey = last_vs_.vkey;
-        sh.vh = last_vs_.vh;
-        sh.vs = last_vs_.entry;
-        g_perf.vs_reuse++;
-        return;
-    }
-    sh.vkey = VertexKey(s, a, sh);
-    EnsureVertexShader(s, a, sh);
-    if (reuse_.pso) {
-        last_vs_.entry = sh.vs;
-        std::memcpy(&last_vs_.in, &in, sizeof(in));
-        last_vs_.vkey = sh.vkey;
-        last_vs_.vh = sh.vh;
-    }
-}
-
-// sets sh.vh and sh.vs, the shader requested on a miss
+// sets sh.vh and sh.vs_code, compiling the shader on a cache miss
 void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
     auto vit = shader_src_.find(sh.vkey);
     if (vit != shader_src_.end()) {
-        sh.vh = vit->second.hash;
-        sh.vs = vit->second.entry;
+        sh.vs_code = blobs_[vit->second].Get();
+        sh.vh = vit->second;
         return;
     }
     std::string src = VertexHlsl(s, a, sh);
-    sh.vs = &RequestShader(sh.quad ? QuadHlsl(std::move(src)) : std::move(src), "main", "vs_5_0", sh.vh, false);
-    shader_src_[sh.vkey] = {sh.vh, sh.vs};
+    sh.vs_code = Compile(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
+    shader_src_[sh.vkey] = sh.vh;
 }
 
 bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
-    {
-        PerfScope perf_bind{g_perf.bind};
-        draw_rt_ = bound_rt_;
-        draw_ds_ = bound_ds_;
-        for (int i = 0; i < 4; i++) {
-            if (reuse_.stages && ReuseStage(s, i, stages)) continue;
-            stages.res[i] = BindTexture(s, i, stages);
-            RememberStage(s, i, stages);
-        }
-    }
-    // a texture's upload or copy may have unbound the targets, a feedback copy or a sampled target moved one out of
-    // its state: only then are they bound again
-    if (reuse_.binds && !TargetsMoved()) return true;
-    g_perf.rebinds++;
+    auto perf_t = PerfClock::now();
+    draw_rt_ = bound_rt_;
+    draw_ds_ = bound_ds_;
+    for (int i = 0; i < 4; i++) stages.res[i] = BindTexture(s, i, stages);
+    g_perf.bind += PerfMs(perf_t);
+    // textures may have recorded copies that unbound the targets
     return BindTargets(s);
-}
-
-// A stage whose header has the bytes this frame's last plain texture bind of the stage was described from, with no
-// texture or target made or dropped since, gets what that bind gave: BindGuestTexture checks a texture's memory once a
-// frame, so binding it again in the frame would only look it up again.
-bool D3D12Backend::ReuseStage(const State& s, int i, DrawTextures& stages) {
-    const StageMemo& m = stage_memo_[i];
-    uint32_t header = s.textures[size_t(i)];
-    if (!m.valid || !header || m.frame != presents_ || m.gen != bind_gen_) return false;
-    uint8_t now[kDescribedBytes];
-    ReadDescribed(header, now);
-    if (std::memcmp(now, m.header, sizeof(now))) return false;
-    stages.info[i] = m.info;
-    stages.sv[i] = m.sv;
-    stages.res[i] = m.res;
-    stages.rt[i] = false;
-    stages.pal[i] = false;
-    stages.k[i] = 1;
-    stages.wide[i] = 0;
-    g_perf.stage_reuse++;
-    return true;
-}
-
-// a stage bound to a plain texture in guest memory is remembered for the next draw; a render target or a P8 texture
-// is bound every time, for its feedback copy, its CPU write check or its palette
-void D3D12Backend::RememberStage(const State& s, int i, const DrawTextures& stages) {
-    StageMemo& m = stage_memo_[i];
-    m.valid = reuse_.stages && stages.res[i] && !stages.rt[i] && !stages.pal[i];
-    if (!m.valid) return;
-    m.frame = presents_;
-    m.gen = bind_gen_;
-    ReadDescribed(s.textures[size_t(i)], m.header);
-    m.info = stages.info[i];
-    std::memcpy(&m.sv, &stages.sv[i], sizeof(m.sv));
-    m.res = stages.res[i];
-}
-
-// what BindTargets would change once the textures are bound
-bool D3D12Backend::TargetsMoved() const {
-    return bound_rt_ != draw_rt_ || bound_ds_ != draw_ds_ ||
-           (draw_rt_ && draw_rt_->state != D3D12_RESOURCE_STATE_RENDER_TARGET) ||
-           (draw_ds_ && draw_ds_->state != D3D12_RESOURCE_STATE_DEPTH_WRITE);
 }
 
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
 
-// the draw before's pixel shader when the key is the same bytes, else EnsurePixelShader's
-void D3D12Backend::ResolvePixelShader(const PixelKey& pk, DrawShaders& sh) {
-    if (reuse_.pso && last_ps_.entry && pk == last_ps_.pk) {
-        sh.pkey = last_ps_.pkey;
-        sh.ph = last_ps_.ph;
-        sh.ps = last_ps_.entry;
-        g_perf.ps_reuse++;
-        return;
-    }
-    sh.pkey = Hash(&pk, sizeof(pk));
-    EnsurePixelShader(pk, sh);
-    if (reuse_.pso) {
-        last_ps_.entry = sh.ps;
-        std::memcpy(&last_ps_.pk, &pk, sizeof(pk));
-        last_ps_.pkey = sh.pkey;
-        last_ps_.ph = sh.ph;
-    }
-}
-
-// sets sh.ph and sh.ps, the shader requested on a miss
+// sets sh.ph and sh.ps_code, compiling the shader on a cache miss
 void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) {
-        sh.ph = pit->second.hash;
-        sh.ps = pit->second.entry;
+        sh.ps_code = blobs_[pit->second].Get();
+        sh.ph = pit->second;
         return;
     }
-    sh.ps = &RequestShader(PixelHlsl(pk), "main", "ps_5_0", sh.ph, false);
-    shader_src_[sh.pkey ^ kPixelKeySalt] = {sh.ph, sh.ps};
+    sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
 void KeyBlend(const State& s, PsoKey& k) {
@@ -3228,40 +2163,22 @@ void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
 }
 
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestExtent size, DrawConstants& c, DrawCall& dc) {
+                                   GuestExtent size, DrawConstants& c) {
+    Alloc vc = Upload(sizeof(s.vsc), 256);
+    std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
+    Alloc dc = Upload(sizeof(DrawConstants), 256);
     FillSurfaceConstants(s, size, c);
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
-    // an extension adjusts the vertex registers as they are uploaded: a copy of them
-    const std::array<std::array<float, 4>, 192>* vsc = &s.vsc;
-    if (ext_) {
-        vsc_scratch_ = s.vsc;
-        ext_->Constants(reinterpret_cast<float(*)[4]>(vsc_scratch_.data()), c.ext, bound_rt_, k.blend ? k.src : 1);
-        vsc = &vsc_scratch_;
-    }
+    if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
     FillTextureConstants(s, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
     }
-    dc.cb[0] = UploadConstantBuffer(*vsc, last_vsc_, g_perf.vsc_reuse);
-    dc.cb[1] = UploadConstantBuffer(c, last_consts_, g_perf.const_reuse);
-}
-
-// v in the frame's ring; the upload before when it holds the same bytes, still there until the ring starts over
-template <typename T>
-D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::UploadConstantBuffer(const T& v, LastUpload<T>& last, uint64_t& reused) {
-    if (reuse_.consts && last.gpu && !std::memcmp(&last.bytes, &v, sizeof(T))) {
-        reused++;
-        return last.gpu;
-    }
-    Alloc a = Upload(sizeof(T), 256);
-    std::memcpy(a.cpu, &v, sizeof(T));
-    if (reuse_.consts) {
-        std::memcpy(&last.bytes, &v, sizeof(T));
-        last.gpu = a.gpu;
-    }
-    return a.gpu;
+    std::memcpy(dc.cpu, &c, sizeof(c));
+    cl_->SetGraphicsRootConstantBufferView(0, vc.gpu);
+    cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
 }
 
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
@@ -3370,48 +2287,28 @@ bool UnitTexcoords(const Assembled& a) {
     return any;
 }
 
-// A stage without a texture gets a null view of its kind; the samplers read the views after. A draw whose four views
-// are the draw before's, the same resources with the same bytes of view, takes that draw's table; one that samples a
-// render target or a P8 texture always writes its own, and looks up its own samplers.
-void D3D12Backend::WriteTextureViews(const State& s, const Assembled& a, DrawTextures& stages, DrawCall& dc) {
-    bool slow = false;
+// a stage without a texture gets a null view of its kind; the samplers read the views after
+void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages) {
+    uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[i];
         if (!stages.res[i]) {
             sv.ViewDimension = NullViewDimension(stages.info[i].kind);
             sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         }
-        slow |= stages.rt[i] || stages.pal[i];
+        dev_->CreateShaderResourceView(stages.res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
-    bool reuse = reuse_.views && !slow;
-    // clamping reads the vertices, and only changes a stage that wraps U or V; the samplers come before the views,
-    // as a full sampler heap ends the list in a submit, which drops the table remembered from the ring too
-    bool wraps = false;
-    for (const auto& t : s.tss) wraps |= t[kTssAddressU] == kTaddressWrap || t[kTssAddressV] == kTaddressWrap;
-    bool clamp = wraps && UnitTexcoords(a);
-    dc.samplers = Gpu(smp_heap_.Get(), EnsureStageSamplers(s, stages, clamp, reuse), smp_inc_);
-    if (reuse && views_.valid && !std::memcmp(views_.res, stages.res, sizeof(views_.res)) &&
-        !std::memcmp(views_.sv, stages.sv, sizeof(views_.sv))) {
-        g_perf.view_reuse++;
-        dc.views = Gpu(srv_heap_.Get(), views_.slot, srv_inc_);
-    } else {
-        uint32_t slot = AllocSrvSlots(4);
-        for (int i = 0; i < 4; i++) {
-            dev_->CreateShaderResourceView(stages.res[i], &stages.sv[i], Cpu(srv_heap_.Get(), slot + i, srv_inc_));
-        }
-        views_.valid = reuse;
-        views_.slot = slot;
-        std::memcpy(views_.res, stages.res, sizeof(views_.res));
-        std::memcpy(views_.sv, stages.sv, sizeof(views_.sv));
-        dc.views = Gpu(srv_heap_.Get(), slot, srv_inc_);
-    }
+    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), slot, srv_inc_));
+    uint32_t samplers = EnsureStageSamplers(s, stages, UnitTexcoords(a));
+    cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
-void D3D12Backend::FillViewportScissor(const State& s, GuestExtent size, DrawCall& dc) const {
+void D3D12Backend::SetViewportScissor(const State& s, GuestExtent size) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
-    dc.viewport = {0, 0, W, H, 0, 1};
+    D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
+    cl_->RSSetViewports(1, &vp);
     float sc = W / size.w;
     LONG x0 = LONG((s.viewport.x + size.dx) * sc);
     LONG y0 = LONG(s.viewport.y * sc);
@@ -3429,13 +2326,16 @@ void D3D12Backend::FillViewportScissor(const State& s, GuestExtent size, DrawCal
         if (x0 <= LONG(size.dx * sc)) x0 = 0;
         if (x1 >= LONG((float(size.w) - size.dx) * sc)) x1 = LONG(W);
     }
-    dc.scissor = {std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
-                  std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
+                    std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    cl_->RSSetScissorRects(1, &rect);
 }
 
-void FillBlendFactorStencilRef(const State& s, DrawCall& dc) {
-    Color(SimpleState(s, kMBlendColor), dc.blend);
-    dc.stencil_ref = SimpleState(s, kMStencilRef) & 0xFF;
+void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
+    float bf[4];
+    Color(SimpleState(s, kMBlendColor), bf);
+    cl_->OMSetBlendFactor(bf);
+    cl_->OMSetStencilRef(SimpleState(s, kMStencilRef) & 0xFF);
 }
 
 D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
@@ -3446,64 +2346,29 @@ D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
     return a.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 }
 
-// the draw's vertices and indices in the frame's ring, and how it is drawn
-void D3D12Backend::UploadGeometry(const Assembled& a, DrawCall& dc) {
-    dc.vb_count = a.buffer_count;
+void D3D12Backend::UploadVertexBuffers(const Assembled& a) {
+    D3D12_VERTEX_BUFFER_VIEW vbv[16];
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
         Alloc vb = Upload(b.bytes, 16);
         std::memcpy(vb.cpu, b.src, b.bytes);
-        dc.vbv[i] = {vb.gpu, b.bytes, b.stride};
+        vbv[i] = {vb.gpu, b.bytes, b.stride};
     }
-    dc.topology = PrimitiveTopology(a);
-    dc.index_count = a.index_count;
-    dc.base_vertex = a.base_vertex;
-    dc.draw_count = a.draw_count;
-    dc.ibv = {};
+    cl_->IASetVertexBuffers(0, a.buffer_count, vbv);
+}
+
+void D3D12Backend::DrawGeometry(const Assembled& a) {
+    UploadVertexBuffers(a);
+    cl_->IASetPrimitiveTopology(PrimitiveTopology(a));
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Alloc ib = Upload(ibytes, 4);
         std::memcpy(ib.cpu, a.index_src, ibytes);
-        dc.ibv = {ib.gpu, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
-    }
-}
-
-// the draw's commands into l; with the fast paths on, what b says l has bound already is left out
-void D3D12Backend::RecordDraw(ID3D12GraphicsCommandList* l, ID3D12PipelineState* pso, const DrawCall& dc, Bound& b) {
-    // an extension may record into the list without a word: then nothing is taken as bound
-    if (ext_) b = {};
-    if (!reuse_.pso || pso != b.pso) {
-        l->SetPipelineState(pso);
-        b.pso = pso;
+        D3D12_INDEX_BUFFER_VIEW ibv{ib.gpu, ibytes, a.index16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        cl_->IASetIndexBuffer(&ibv);
+        cl_->DrawIndexedInstanced(a.index_count, 1, 0, a.base_vertex, 0);
     } else {
-        g_perf.pso_bound++;
-    }
-    for (UINT i = 0; i < 2; i++) {
-        if (reuse_.consts && dc.cb[i] == b.cb[i]) continue;
-        l->SetGraphicsRootConstantBufferView(i, dc.cb[i]);
-        b.cb[i] = dc.cb[i];
-    }
-    const D3D12_GPU_DESCRIPTOR_HANDLE tables[2] = {dc.views, dc.samplers};
-    for (UINT i = 0; i < 2; i++) {
-        if (reuse_.views && tables[i].ptr == b.table[i]) continue;
-        l->SetGraphicsRootDescriptorTable(2 + i, tables[i]);
-        b.table[i] = tables[i].ptr;
-    }
-    l->RSSetViewports(1, &dc.viewport);
-    l->RSSetScissorRects(1, &dc.scissor);
-    if (l == cl_.Get()) {
-        om_vp_ = dc.viewport;
-        om_sc_ = dc.scissor;
-    }
-    l->OMSetBlendFactor(dc.blend);
-    l->OMSetStencilRef(dc.stencil_ref);
-    l->IASetVertexBuffers(0, dc.vb_count, dc.vbv);
-    l->IASetPrimitiveTopology(dc.topology);
-    if (dc.index_count) {
-        l->IASetIndexBuffer(&dc.ibv);
-        l->DrawIndexedInstanced(dc.index_count, 1, 0, dc.base_vertex, 0);
-    } else {
-        l->DrawInstanced(dc.draw_count, 1, 0, 0);
+        cl_->DrawInstanced(a.draw_count, 1, 0, 0);
     }
 }
 
@@ -3518,11 +2383,9 @@ struct DrawEnd {
 // Assemble, timed and counted
 bool D3D12Backend::AssembleDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count,
                                 const uint8_t* indices, Assembled& a) {
-    bool assembled;
-    {
-        PerfScope perf_assemble{g_perf.assemble};
-        assembled = Assemble(s, prim, start, count, indices, a);
-    }
+    auto perf_t = PerfClock::now();
+    bool assembled = Assemble(s, prim, start, count, indices, a);
+    g_perf.assemble += PerfMs(perf_t);
     g_perf.verts += a.vertex_count;
     g_perf.raw += a.vertices.empty();
     return assembled;
@@ -3531,8 +2394,6 @@ bool D3D12Backend::AssembleDraw(const State& s, uint32_t prim, uint32_t start, u
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
-    // lists held back behind a draw whose pipeline is made by now go to the GPU
-    if (!pending_.empty()) RunPending(false);
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s)) return;
     DrawEnd draw_end{ext_};
@@ -3544,11 +2405,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     {
         PerfScope perf_targets{g_perf.tgt};
         if (!BindTargets(s)) return;
-        if (ext_) {
-            bool again = ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed);
-            ForgetBindings();
-            if (again && !BindTargets(s)) return;
-        }
+        if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
     }
 
     // vertex shader
@@ -3557,49 +2414,32 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         PerfScope perf_pso{g_perf.pso};
         sh = ClassifyShaders(s, a, count);
         if (sh.prog) EnsureProgramHash(s);
-        ResolveVertexShader(s, a, sh);
+        sh.vkey = VertexKey(s, a, sh);
+        EnsureVertexShader(s, a, sh);
     }
-    // stage textures, then the pixel shader made for them, then the pipeline
+    // stage textures, then the pixel shader made for them
     DrawTextures stages;
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PsoKey k;
     PixelKey pk;
-    PipelineEntry* pipe;
+    ID3D12PipelineState* pso = nullptr;
     {
         PerfScope perf_pso{g_perf.pso};
         pk = MakePixelKey(s, stages.info);
         pk.quad = sh.quad;
-        ResolvePixelShader(pk, sh);
-        // a shader that failed to compile draws nothing
-        if (Failed(*sh.vs) || Failed(*sh.ps)) return;
+        sh.pkey = Hash(&pk, sizeof(pk));
+        EnsurePixelShader(pk, sh);
+        if (!sh.vs_code || !sh.ps_code) return;
         BuildPipelineKey(s, a, sh.vh, sh.ph, k);
-        pipe = &ResolvePipeline(k, sh);
-        if (!defer_ && !pipe->done.load(std::memory_order_acquire)) {
-            PerfScope perf_stall{g_perf.compile};
-            WaitMade(pipe->done);
-        }
+        pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     }
-    // a pipeline still being made: the draw is recorded once it is, in its place among the others
-    bool ready = pipe->done.load(std::memory_order_acquire);
-    if (ready && !pipe->pso) return;
-
-    // texture views and samplers, before the constants: a full descriptor ring or sampler heap ends the list in a
-    // submit there, and the constants and geometry below take ring addresses that submit would free
-    DrawCall dc;
-    {
-        PerfScope perf_views{g_perf.views};
-        WriteTextureViews(s, a, stages, dc);
-        // a full descriptor ring or sampler heap ended the list in a submit: the targets are bound again
-        if (!bound_rt_ && !bound_ds_ && !BindTargets(s)) return;
-    }
+    if (!pso) return;
+    cl_->SetPipelineState(pso);
 
     // constants
     GuestExtent size = BoundExtent(bound_rt_ ? s.rt : s.zs);
     DrawConstants c{};
-    {
-        PerfScope perf_consts{g_perf.consts};
-        UploadConstants(s, sh, k, stages, size, c, dc);
-    }
+    { PerfScope perf_consts{g_perf.consts}; UploadConstants(s, sh, k, stages, size, c); }
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
@@ -3607,23 +2447,16 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         CaptureShaders(s, a, sh, pk);
     }
 
-    // viewport and scissor, blend factor and stencil reference
+    // texture views and samplers, viewport and scissor, blend factor and stencil reference
     {
         PerfScope perf_views{g_perf.views};
-        FillViewportScissor(s, size, dc);
-        FillBlendFactorStencilRef(s, dc);
+        SetTextureViewsAndSamplers(s, a, stages);
+        SetViewportScissor(s, size);
+        SetBlendFactorStencilRef(s);
     }
 
-    // geometry, then the draw
-    {
-        PerfScope perf_geom{g_perf.geom};
-        UploadGeometry(a, dc);
-        if (ready) {
-            RecordDraw(cl_.Get(), pipe->pso.Get(), dc, bound_);
-        } else {
-            Defer(*pipe, dc);
-        }
-    }
+    // geometry
+    { PerfScope perf_geom{g_perf.geom}; DrawGeometry(a); }
 }
 
 // a guest rect scaled to the target and clamped to it; the frame target is wider than the console's frame, so
@@ -3772,7 +2605,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
     Transition(src_res, src_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
-    SetOm(&rh, nullptr);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     float src_scale = float(src_t.w) / src_t.gw;
     float dst_scale = float(dst_t.w) / dst_t.gw;
     bool listed = l.count && l.src_rects;
@@ -3789,7 +2622,8 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
         D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
         if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) continue;
-        SetOmViewport(vp, scissor);
+        cl_->RSSetViewports(1, &vp);
+        cl_->RSSetScissorRects(1, &scissor);
         float uv[4] = {r.x0 / src_t.gw, r.y0 / src_t.gh, (r.x1 - r.x0) / src_t.gw, (r.y1 - r.y0) / src_t.gh};
         uint32_t taps = uint32_t(std::ceil(std::max(src_scale / dst_scale, 1.0f) - kTapsSlack));
         float mul = 1 / dst_t.range;
@@ -3879,7 +2713,6 @@ void D3D12Backend::ResizeSwap() {
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
     if (w == bb_w_ && h == bb_h_) return;
-
     Flush();
     for (auto& f : frames_) {
         if (f.fence) WaitFence(f.fence);
@@ -3957,7 +2790,8 @@ void D3D12Backend::BlitFrame(Target& t) {
     float uv[4] = {0, 0, 1, 1};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
-    SetOmViewport(vp, scissor);
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
 }
@@ -3972,8 +2806,6 @@ void D3D12Backend::RenderUi() {
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
-    // the UI set its own heap, root signature and pipeline
-    ForgetBindings();
 }
 
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -3982,7 +2814,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
     float black[4] = {0, 0, 0, 1};
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
-    SetOm(&rh, nullptr);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
     RenderUi();
@@ -3993,51 +2825,30 @@ void D3D12Backend::ReleaseOldTextures() {
     constexpr uint64_t kSweepEvery = 60;    // presents between sweeps
     constexpr size_t kTexturesKept = 2048;  // no sweep below this many
     constexpr uint64_t kIdleFrames = 600;
+    // textures unused for ten seconds go, levels stream theirs in and out
     if (presents_ % kSweepEvery != 0 || textures_.size() <= kTexturesKept) return;
-    // a card with room keeps every decoded texture: the title cycles through the same ones, and a swept one is
-    // decoded and uploaded again on its next use
-    if (vram_budget_ && WithinBudget()) return;
-    // past the budget, textures unused for ten seconds go, levels stream theirs in and out
-    bool swept = false;
     for (auto it = textures_.begin(); it != textures_.end();) {
         if (it->second.frame + kIdleFrames < presents_) {
             CurrentFrame().garbage.push_back(it->second.res);
-            tex_bytes_ -= it->second.bytes;
             it = textures_.erase(it);
-            swept = true;
         } else {
             ++it;
         }
     }
-    // a stage that remembers a swept texture binds it again
-    if (swept) bind_gen_++;
-}
-
-// a quarter of the local video memory budget to spare, for the targets and textures a new place brings; false when
-// the budget cannot be read
-bool D3D12Backend::WithinBudget() const {
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
-    return VideoMemory(mi) && mi.CurrentUsage <= mi.Budget / 4 * 3;
-}
-
-// the local video memory the OS gives this process, and how much of it is in use
-bool D3D12Backend::VideoMemory(DXGI_QUERY_VIDEO_MEMORY_INFO& mi) const {
-    return adapter_ && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi));
 }
 
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     if (f.fence && fence_->GetCompletedValue() < f.fence) {
-        PerfScope perf_wait{g_perf.wait};
+        auto perf_wait = PerfClock::now();
         WaitFence(f.fence);
+        g_perf.wait += PerfMs(perf_wait);
     }
     f.alloc->Reset();
-    f.defer_alloc->Reset();
     f.garbage.clear();
     f.used = 0;
     f.srv = 0;
-    ForgetUploads();
-    if (cl_) cl_->Reset(f.alloc.Get(), nullptr);
+    cl_->Reset(f.alloc.Get(), nullptr);
     Begin();
 }
 
@@ -4052,8 +2863,7 @@ void D3D12Backend::CountFps() {
     }
 }
 
-// true once a second, when it logged
-bool LogPerf() {
+void LogPerf() {
     static PerfClock::time_point perf_start = PerfClock::now();
     static uint64_t perf_frames = 0;
     perf_frames++;
@@ -4086,37 +2896,10 @@ bool LogPerf() {
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
              p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos);
-        LOGI("perf: reuse per frame: stages %.0f views %.0f samplers %.0f | vs %.0f ps %.0f pipelines %.0f (%.0f "
-             "already bound) | vs constants %.0f constants %.0f | target rebinds %.0f depth probes %.0f | %.1f draws "
-             "waited for a pipeline",
-             p.stage_reuse / n, p.view_reuse / n, p.sampler_reuse / n, p.vs_reuse / n, p.ps_reuse / n,
-             p.pso_reuse / n, p.pso_bound / n, p.vsc_reuse / n, p.const_reuse / n, p.rebinds / n, p.probes / n,
-             p.deferred / n);
-        LOGI("perf: this second: %llu shaders compiled (%.1f ms of compiling on any thread), %llu read from disk | "
-             "%llu pipelines made, %llu from disk blobs, %llu blobs turned down",
-             (unsigned long long)g_made.compiled.exchange(0), g_made.compile_ns.exchange(0) / 1e6,
-             (unsigned long long)g_made.disk_shaders.exchange(0), (unsigned long long)g_made.psos.exchange(0),
-             (unsigned long long)g_made.disk_psos.exchange(0), (unsigned long long)g_made.refused.exchange(0));
         g_perf = Perf{};
         perf_start = PerfClock::now();
         perf_frames = 0;
-        return true;
     }
-    return false;
-}
-
-// the video memory budget and what the decoded textures hold of it, once a second with diag::Perf
-void D3D12Backend::LogResidency() {
-    constexpr double kMb = 1048576.0;
-    DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
-    bool known = VideoMemory(mi);
-    const char* policy = !vram_budget_ ? "swept on schedule (XBE_NO_VRAM_BUDGET)"
-                         : !known      ? "swept on schedule (no budget)"
-                         : mi.CurrentUsage <= mi.Budget / 4 * 3 ? "kept resident"
-                                                                : "past three quarters of the budget, swept on schedule";
-    LOGI("perf: video memory %.0f of %.0f MB local budget, %zu textures resident %.1f MB, %s",
-         known ? mi.CurrentUsage / kMb : -1.0, known ? mi.Budget / kMb : -1.0, textures_.size(), tex_bytes_ / kMb,
-         policy);
 }
 
 void D3D12Backend::Present(const Surface& front) {
@@ -4137,14 +2920,9 @@ void D3D12Backend::Present(const Surface& front) {
     DrawFrame(t, bi);
     Submit(false);
     bool vsync = app::Get().vsync;
-    {
-        PerfScope perf_swap{g_perf.swap};
-        swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    }
-    // the back buffer just presented is the display's now, in present state: the next list must not start
-    // from its render target binding the way it may from a guest target's (Begin replays what SetOm left,
-    // and rebinding a presented back buffer at a list's head removes the device on the NVIDIA driver)
-    om_rt_ = om_ds_ = false;
+    auto perf_swap = PerfClock::now();
+    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    g_perf.swap += PerfMs(perf_swap);
 
     presents_++;
     presents_seen_.store(presents_);
@@ -4152,7 +2930,7 @@ void D3D12Backend::Present(const Surface& front) {
     ReleaseOldTextures();
     ResetFrame();
     CountFps();
-    if (diag::Perf() && LogPerf()) LogResidency();
+    if (diag::Perf()) LogPerf();
     ApplySettings();
 }
 
@@ -4164,12 +2942,10 @@ void D3D12Backend::ApplySettings() {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();
-        TargetsChanged();
         scale_ = want;
         widen_ = wide;
         if (ext_) ext_->Reset(*this);
         bound_rt_ = bound_ds_ = nullptr;
-        ForgetBindings();
     }
 }
 

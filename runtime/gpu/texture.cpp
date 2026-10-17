@@ -544,26 +544,19 @@ uint32_t PackColor(const std::array<float, 4>& c) {
 
 // PSC0Mapping and PSC1Mapping give each combiner stage the D3D constant its C0 and C1 read,
 // PSFinalCombinerConstants does the same for the final combiner. 0xF leaves the literal in place.
-// The writes are marked for the recorder like every write to a State, at once after the last.
 void ApplyPixelConstants(State& s, uint32_t first, uint32_t count) {
     if (!s.ps) return;
     const uint32_t* d = s.ps->def;
     uint32_t c0map = d[57], c1map = d[58], fmap = d[59];
     auto mine = [&](uint32_t m) { return m >= first && m < first + count && m < 8; };
-    State::Marks marks;
-    auto put = [&](uint32_t method, const std::array<float, 4>& c) {
-        s.simple[method >> 2] = PackColor(c);
-        s.Add(marks, &s.simple[method >> 2], 4);
-    };
     for (uint32_t i = 0; i < 8; i++) {
         uint32_t m0 = (c0map >> (i * 4)) & 0xF, m1 = (c1map >> (i * 4)) & 0xF;
-        if (mine(m0)) put(kMPsConstant0 + i * 4, s.psc[m0]);
-        if (mine(m1)) put(kMPsConstant1 + i * 4, s.psc[m1]);
+        if (mine(m0)) s.simple[(kMPsConstant0 >> 2) + i] = PackColor(s.psc[m0]);
+        if (mine(m1)) s.simple[(kMPsConstant1 >> 2) + i] = PackColor(s.psc[m1]);
     }
     uint32_t f0 = fmap & 0xF, f1 = (fmap >> 4) & 0xF;
-    if (mine(f0)) put(kMPsFinalConstant0, s.psc[f0]);
-    if (mine(f1)) put(kMPsFinalConstant1, s.psc[f1]);
-    s.Mark(marks);
+    if (mine(f0)) s.simple[kMPsFinalConstant0 >> 2] = PackColor(s.psc[f0]);
+    if (mine(f1)) s.simple[kMPsFinalConstant1 >> 2] = PackColor(s.psc[f1]);
 }
 
 }  // namespace gpu

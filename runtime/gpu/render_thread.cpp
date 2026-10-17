@@ -12,15 +12,11 @@
 #include <smmintrin.h>
 
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <condition_variable>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -64,67 +60,14 @@ struct Batch {
     std::vector<std::shared_ptr<PixelShader>> ps;
 };
 
+// the plain data in State, around its shader pointers and the resource headers (sent as copies); of the transforms only
+// view, projection, texture and world are drawn with
 struct Range {
     size_t off, len;
 };
 size_t At(const State& s, const void* p) { return size_t(static_cast<const uint8_t*>(p) - reinterpret_cast<const uint8_t*>(&s)); }
-
-// the field holding a byte of State, to name it in the logs
-std::string FieldAt(size_t off) {
-    static const State s;
-    struct Field {
-        const char* name;
-        const void* at;
-        size_t size, row;  // row: bytes per element, 0 for one value
-    };
-    const Field fields[] = {
-        {"simple", &s.simple, sizeof(s.simple), 4},
-        {"rs", &s.rs, sizeof(s.rs), 4},
-        {"tss", &s.tss, sizeof(s.tss), sizeof(s.tss[0])},
-        {"textures", &s.textures, sizeof(s.textures), 4},
-        {"palettes", &s.palettes, sizeof(s.palettes), 4},
-        {"streams", &s.streams, sizeof(s.streams), sizeof(s.streams[0])},
-        {"index_buffer", &s.index_buffer, 4, 0},
-        {"index_data", &s.index_data, 4, 0},
-        {"base_vertex", &s.base_vertex, 4, 0},
-        {"vs_handle", &s.vs_handle, 4, 0},
-        {"vsc", &s.vsc, sizeof(s.vsc), sizeof(s.vsc[0])},
-        {"psc", &s.psc, sizeof(s.psc), sizeof(s.psc[0])},
-        {"viewport", &s.viewport, sizeof(s.viewport), 0},
-        {"rt", &s.rt, sizeof(s.rt), 0},
-        {"zs", &s.zs, sizeof(s.zs), 0},
-        {"scissor_count", &s.scissor_count, 4, 0},
-        {"scissors", &s.scissors, sizeof(s.scissors), 4},
-        {"transforms", &s.transforms, sizeof(s.transforms), sizeof(s.transforms[0])},
-        {"material", &s.material, sizeof(s.material), 4},
-        {"lights", &s.lights, sizeof(s.lights), sizeof(s.lights[0])},
-        {"light_enable", &s.light_enable, 4, 0},
-        {"ss_offset_x", &s.ss_offset_x, 4, 0},
-        {"ss_offset_y", &s.ss_offset_y, 4, 0},
-        {"zscale", &s.zscale, 4, 0},
-    };
-    char text[80] = "no field";
-    for (const Field& f : fields) {
-        size_t base = At(s, f.at);
-        if (off < base || off - base >= f.size) continue;
-        size_t at = off - base;
-        if (f.at == &s.simple) std::snprintf(text, sizeof(text), "simple[%zu], method 0x%zX", at / 4, at & ~size_t(3));
-        else if (!f.row) std::snprintf(text, sizeof(text), "%s byte %zu", f.name, at);
-        else if (f.row == 4) std::snprintf(text, sizeof(text), "%s[%zu]", f.name, at / 4);
-        else std::snprintf(text, sizeof(text), "%s[%zu] dword %zu", f.name, at / f.row, at % f.row / 4);
-        break;
-    }
-    return text;
-}
-
-// the plain data in State, around its shader pointers and the resource headers (sent as copies); of the transforms only
-// view, projection, texture and world are drawn with
 std::vector<Range> StateRanges() {
     static const State s;
-    // the last range ends at dirty: bytes after it would never be compared or sent
-    if (size_t end = At(s, &s.dirty) + sizeof(s.dirty); end != sizeof(State))
-        LOGE("render thread: State::dirty must stay State's last member, bytes %zu-%zu after it are never sent", end,
-             sizeof(State) - 1);
     return {
         {At(s, &s.simple), At(s, &s.textures) - At(s, &s.simple)},
         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
@@ -133,44 +76,11 @@ std::vector<Range> StateRanges() {
         {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
         {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
         {At(s, &s.transforms[256]), sizeof(s.transforms[0])},
-        {At(s, &s.material), At(s, &s.dirty) - At(s, &s.material)},
+        {At(s, &s.material), sizeof(State) - At(s, &s.material)},
     };
 }
 
-// Those ranges in the 64 byte pieces SendState compares and sends, in order of offset. The pieces over a block are a
-// run (BlockPieces) only while the ranges are in order of offset and apart; when they are not, ordered is false and
-// every piece is compared on every command.
-std::vector<Range> StatePieces(bool& ordered) {
-    std::vector<Range> pieces;
-    ordered = true;
-    Range prev{0, 0};
-    for (const Range& r : StateRanges()) {
-        if (r.off < prev.off + prev.len) {
-            LOGE("render thread: the state range from %s (byte %zu) starts before the one from %s ends (byte %zu): the "
-                 "ranges must be in order of offset and apart, every state piece is compared on every command",
-                 FieldAt(r.off).c_str(), r.off, FieldAt(prev.off).c_str(), prev.off + prev.len);
-            ordered = false;
-        }
-        prev = r;
-        for (size_t off = r.off, end = r.off + r.len; off < end; off += 64)
-            pieces.push_back({off, std::min<size_t>(64, end - off)});
-    }
-    return pieces;
-}
-
-// for each 64 byte block of State, a bit of State::dirty, the pieces over it as [first, end): the pieces are in order,
-// so the ones over a block are a run
-std::vector<std::pair<uint16_t, uint16_t>> BlockPieces(const std::vector<Range>& pieces) {
-    std::vector<std::pair<uint16_t, uint16_t>> blocks(State::kDirtyWords * 64);
-    for (size_t i = 0; i < pieces.size(); i++)
-        for (size_t b = pieces[i].off / 64; b <= (pieces[i].off + pieces[i].len - 1) / 64; b++) {
-            if (blocks[b].first == blocks[b].second) blocks[b].first = uint16_t(i);
-            blocks[b].second = uint16_t(i + 1);
-        }
-    return blocks;
-}
-
-// equal bytes, 16 at a time: state pieces and resource headers are compared on every command
+// equal bytes, 16 at a time: most of the state is compared on every draw
 bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
     size_t i = 0;
     __m128i diff = _mm_setzero_si128();
@@ -186,24 +96,9 @@ uint64_t Ns(Clock::time_point t) { return uint64_t(std::chrono::duration_cast<st
 
 class Threaded final : public Backend {
 public:
-    explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)) {
-        bool ordered;
-        pieces_ = StatePieces(ordered);
-        block_pieces_ = BlockPieces(pieces_);
+    explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()) {
         ring_ = mem::AllocSystem(kHeaderRing, 64);
         cur_ = NewBatch();
-        if (verify_) {
-            covered_.resize(pieces_.size());
-            reported_.resize(pieces_.size());
-            LOGR("render thread: XBE_STATE_VERIFY in a %s build: all %zu state pieces compared on every command, a "
-                 "change no write marked is logged (the first %u pieces)",
-                 logx::kVerbose ? "verbose" : "release (NDEBUG)", pieces_.size(), kUnmarkedLogs);
-        } else if (all_) {
-            LOGR("render thread: XBE_NO_STATE_DIRTY, all %zu state pieces compared on every command", pieces_.size());
-        }
-        if (!use_skip_) LOGR("render thread: XBE_NO_USE_SKIP, every draw marks the resources it reads");
-        ordered_ = ordered;
-        if (!ordered_) all_ = true;  // StatePieces logged why
         std::thread([this] { Run(); }).detach();
     }
     ~Threaded() override {
@@ -231,14 +126,12 @@ public:
             c.data = Put(indices, size_t(count) * 2);
         }
         cur_->cmds.push_back(c);
-        if (!SameUses(s)) {
-            for (uint32_t tex : s.textures) Use(tex);
-            for (uint32_t pal : s.palettes) Use(pal);
-            for (const auto& st : s.streams) Use(st.vb);
-            Use(s.rt.header);
-            Use(s.zs.header);
-            Written(s.rt);
-        }
+        for (uint32_t tex : s.textures) Use(tex);
+        for (uint32_t pal : s.palettes) Use(pal);
+        for (const auto& st : s.streams) Use(st.vb);
+        Use(s.rt.header);
+        Use(s.zs.header);
+        Written(s.rt);
         if (cur_->cmds.size() >= kBatchCommands) Submit();
         g_perf_capture_ns += Ns(t);
     }
@@ -406,41 +299,14 @@ private:
         std::memcpy(cur_->bytes.data() + at + 8, value, n);
     }
 
-    // What changed since the last command, in 64 byte pieces: those under the blocks of State marked written since, or
-    // with XBE_NO_STATE_DIRTY, XBE_STATE_VERIFY or the state ranges out of order all of them. In order either way, so a
-    // change is the same bytes.
+    // what changed since the last command, in 64 byte pieces
     void SendState(const State& s) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
-        const uint8_t* sent = reinterpret_cast<const uint8_t*>(&sent_);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
-        // taken first, a word at a time with an exchange: a mark set after its word is taken stays for the next command
-        std::array<uint64_t, State::kDirtyWords> marks;
-        for (size_t w = 0; w < marks.size(); w++)
-            marks[w] = s.dirty.words[w].load(std::memory_order_relaxed)
-                           ? s.dirty.words[w].exchange(0, std::memory_order_acquire)
-                           : 0;
-        if (all_) {
-            // with the ranges out of order block_pieces_ does not describe the pieces, so its coverage says nothing
-            if (verify_ && ordered_) {
-                std::fill(covered_.begin(), covered_.end(), uint8_t(0));
-                MarkedPieces(marks, [&](uint32_t from, uint32_t end) {
-                    std::fill(covered_.begin() + from, covered_.begin() + end, uint8_t(1));
-                });
-            }
-            for (uint32_t i = 0; i < pieces_.size(); i++) {
-                const Range& p = pieces_[i];
-                if (verify_ && ordered_ && !covered_[i]) Unmarked(i, now);
-                Delta(sent + p.off, now + p.off, p.len);
-            }
-        } else {
-            uint32_t next = 0;  // the pieces before it are done: one over two marked blocks is compared once
-            MarkedPieces(marks, [&](uint32_t from, uint32_t end) {
-                for (uint32_t i = std::max(from, next); i < end; i++)
-                    Delta(sent + pieces_[i].off, now + pieces_[i].off, pieces_[i].len);
-                next = std::max(next, end);
-            });
-        }
+        for (const Range& r : ranges_)
+            for (size_t off = r.off, end = r.off + r.len; off < end; off += 64)
+                Delta(reinterpret_cast<const uint8_t*>(&sent_) + off, now + off, std::min<size_t>(64, end - off));
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
@@ -469,52 +335,6 @@ private:
         c.data = uint32_t(first);
         c.size = uint32_t(cur_->bytes.size() - first);
         cur_->cmds.push_back(c);
-    }
-
-    // the runs of pieces under the marked blocks, in order
-    template <typename F>
-    void MarkedPieces(const std::array<uint64_t, State::kDirtyWords>& marks, F&& f) const {
-        for (size_t w = 0; w < marks.size(); w++)
-            for (uint64_t bits = marks[w]; bits; bits &= bits - 1) {
-                const auto& [from, end] = block_pieces_[w * 64 + size_t(std::countr_zero(bits))];
-                f(uint32_t(from), uint32_t(end));
-            }
-    }
-
-    // XBE_STATE_VERIFY: a piece no mark covered differs from what was sent, so a writer of State did not mark (or, on a
-    // thread without the device lock, has written and not marked yet). Named once per piece, the first kUnmarkedLogs
-    // pieces, at the level a release build writes.
-    void Unmarked(uint32_t piece, const uint8_t* now) {
-        const Range& p = pieces_[piece];
-        const uint8_t* sent = reinterpret_cast<const uint8_t*>(&sent_);
-        if (reported_[piece] || unmarked_logged_ >= kUnmarkedLogs || Same(sent + p.off, now + p.off, p.len)) return;
-        size_t at = p.off;
-        while (sent[at] == now[at]) at++;
-        reported_[piece] = 1;
-        unmarked_logged_++;
-        size_t dat = std::min(at & ~size_t(3), p.off + p.len - 4);  // the dword holding it, inside the piece
-        uint32_t was, is;
-        std::memcpy(&was, sent + dat, 4);
-        std::memcpy(&is, now + dat, 4);
-        LOGR("render thread: state piece %u (bytes %zu-%zu) changed with no mark, at %s: %08X -> %08X", piece, p.off,
-             p.off + p.len - 1, FieldAt(dat).c_str(), was, is);
-    }
-
-    // Whether a draw reads the resources the draw before it in this batch read, which Use and Written marked then, so
-    // marking them again changes nothing. Busy checks, resource waits and read-backs go by those marks: a batch must
-    // not end with a resource of its draws unmarked. Use's marks only grow; Written's is taken back by a read-back
-    // alone, which ends the batch before another draw.
-    bool SameUses(const State& s) {
-        if (!use_skip_) return false;
-        auto same = [](const auto& a, const auto& b) {
-            return Same(reinterpret_cast<const uint8_t*>(&a), reinterpret_cast<const uint8_t*>(&b), sizeof(a));
-        };
-        if (uses_batch_ == cur_->id && same(s.textures, uses_.textures) && same(s.palettes, uses_.palettes) &&
-            same(s.streams, uses_.streams) && same(s.rt, uses_.rt) && same(s.zs, uses_.zs))
-            return true;
-        uses_ = {s.textures, s.palettes, s.streams, s.rt, s.zs};
-        uses_batch_ = cur_->id;
-        return false;
     }
 
     // resources by guest header: the batch that last read them
@@ -615,15 +435,7 @@ private:
     }
 
     std::unique_ptr<Backend> inner_;
-    // XBE_STATE_VERIFY: every piece compared, and a change no mark covered logged; XBE_NO_STATE_DIRTY: every piece
-    // compared, as before the marks, which state ranges out of order also force; XBE_NO_USE_SKIP: every draw marks the
-    // resources it reads
-    const bool verify_ = std::getenv("XBE_STATE_VERIFY") != nullptr;
-    bool all_ = verify_ || std::getenv("XBE_NO_STATE_DIRTY") != nullptr;
-    const bool use_skip_ = std::getenv("XBE_NO_USE_SKIP") == nullptr;
-    std::vector<Range> pieces_;
-    std::vector<std::pair<uint16_t, uint16_t>> block_pieces_;  // by block of State: the pieces over it
-    bool ordered_ = true;  // the ranges came out in order of offset: block_pieces_ describes the pieces
+    std::vector<Range> ranges_;
 
     // the title's thread
     struct HeaderCopy {
@@ -648,18 +460,6 @@ private:
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0, last_present_ = 0;
-    // the resources the last draw marked, and in which batch (0: none)
-    struct Uses {
-        std::array<uint32_t, 4> textures, palettes;
-        std::array<State::Stream, 16> streams;
-        Surface rt, zs;
-    };
-    Uses uses_{};
-    uint64_t uses_batch_ = 0;
-    // XBE_STATE_VERIFY: the pieces this command's marks cover, the pieces logged, and how many
-    std::vector<uint8_t> covered_, reported_;
-    uint32_t unmarked_logged_ = 0;
-    static constexpr uint32_t kUnmarkedLogs = 32;
 
     // the render thread
     State state_;
