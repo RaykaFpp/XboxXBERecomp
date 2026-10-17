@@ -1,7 +1,10 @@
 #pragma once
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 // Everything the title handed to the XDK Direct3D API, as the API defines it. The renderer translates
@@ -181,6 +184,78 @@ struct State {
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
     float zscale = 16777215.0f;  // depth buffer units per 1.0
+
+    // Not API state, and kept last (the recorder sends the plain data before it): the 64 byte blocks written since the
+    // render thread's recorder last took them, a bit each, so it compares only those with what it sent. Whoever writes
+    // a State that is drawn marks what it wrote, after writing it: Set, or Mark after a memcpy or a loop. A State made,
+    // copied or assigned whole is all written. XBE_STATE_VERIFY=1 logs a change no mark covered.
+    // The XDK setters that do not take the device lock may write while the recorder takes the marks: a mark is an
+    // atomic or with release after the write, and the recorder takes a word with an exchange with acquire, so no
+    // write is lost for good and every write is delivered by a later command. The state bytes themselves are plain,
+    // so a writer truly running beside the recorder is still formally a data race and can give one torn draw, which
+    // the next command repairs because the mark comes after the write. That needs Direct3D called from two guest
+    // threads at once, which the XDK does not allow.
+    static constexpr size_t kDirtyWords = 12;
+    // Dirty's declared copies suppress State's moves: std::move(State) would copy ~46 KB and mark it all written
+    struct Dirty {
+        std::array<std::atomic<uint64_t>, kDirtyWords> words;
+        Dirty() { All(); }
+        Dirty(const Dirty&) { All(); }
+        Dirty& operator=(const Dirty&) {
+            All();
+            return *this;
+        }
+        void All() {
+            for (auto& w : words) w.store(~0ull, std::memory_order_release);
+        }
+    };
+    mutable Dirty dirty;
+
+    // n bytes at p were written
+    void Mark(const void* p, size_t n) {
+        if (!n) return;
+        size_t first = Offset(p) / 64, last = (Offset(p) + n - 1) / 64;
+        for (size_t w = first / 64; w <= last / 64; w++)
+            dirty.words[w].fetch_or(Bits(w, first, last), std::memory_order_release);
+    }
+    // a field was written; a pointer is not a field
+    template <typename T>
+        requires(!std::is_pointer_v<T>)
+    void Mark(const T& field) {
+        Mark(&field, sizeof(field));
+    }
+    // writes a field, then marks it
+    template <typename T>
+    void Set(T& field, const std::type_identity_t<T>& v) {
+        field = v;
+        Mark(field);
+    }
+    // many writes marked at once, a locked or per word rather than per write: Add after each write, Mark after the last
+    struct Marks {
+        std::array<uint64_t, kDirtyWords> bits{};
+    };
+    void Add(Marks& m, const void* p, size_t n) const {
+        if (!n) return;
+        size_t first = Offset(p) / 64, last = (Offset(p) + n - 1) / 64;
+        for (size_t w = first / 64; w <= last / 64; w++) m.bits[w] |= Bits(w, first, last);
+    }
+    void Mark(const Marks& m) {
+        for (size_t w = 0; w < kDirtyWords; w++)
+            if (m.bits[w]) dirty.words[w].fetch_or(m.bits[w], std::memory_order_release);
+    }
+
+private:
+    size_t Offset(const void* p) const {
+        return size_t(static_cast<const uint8_t*>(p) - reinterpret_cast<const uint8_t*>(this));
+    }
+    // the bits in dirty word w of blocks first to last
+    static uint64_t Bits(size_t w, size_t first, size_t last) {
+        size_t lo = first > w * 64 ? first - w * 64 : 0, hi = last < w * 64 + 63 ? last - w * 64 : 63;
+        return (~0ull << lo) & (~0ull >> (63 - hi));
+    }
 };
+static_assert(sizeof(State) <= State::kDirtyWords * 64 * 64, "State::dirty has a bit per 64 bytes");
+static_assert(offsetof(State, dirty) + sizeof(State::Dirty) == sizeof(State),
+              "State::dirty must stay State's last member");
 
 }  // namespace gpu

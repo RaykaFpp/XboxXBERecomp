@@ -6,6 +6,21 @@ get_filename_component(XBE_SDK_DIR ${CMAKE_CURRENT_LIST_DIR}/.. ABSOLUTE)
 file(TO_NATIVE_PATH "${XBE_SDK_DIR}" XBE_SDK_DIR_NATIVE)
 file(WRITE ${CMAKE_BINARY_DIR}/sdk_dir.txt "${XBE_SDK_DIR_NATIVE}\n")
 
+
+# clang targeting the MSVC ABI leaves CMAKE_<LANG>_FLAGS_<CONFIG> empty here, so a Release build
+# compiled the host runtime, the dependencies and the tools at -O0 while only the generated guest
+# code carried the -O2 set per source below. Measured consequence: the recorder's per-draw state
+# compare cost several times what its byte count predicts. NDEBUG is deliberately left undefined -
+# the log's verbose mode keys off it (core/log.cpp), and dropping to the release log format is a
+# separate decision from optimising.
+foreach(cfg RELEASE RELWITHDEBINFO)
+    if(NOT CMAKE_C_FLAGS_${cfg} MATCHES "-O")
+        set(CMAKE_C_FLAGS_${cfg} "${CMAKE_C_FLAGS_${cfg}} -O2" CACHE STRING "" FORCE)
+    endif()
+    if(NOT CMAKE_CXX_FLAGS_${cfg} MATCHES "-O")
+        set(CMAKE_CXX_FLAGS_${cfg} "${CMAKE_CXX_FLAGS_${cfg}} -O2" CACHE STRING "" FORCE)
+    endif()
+endforeach()
 include(FetchContent)
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

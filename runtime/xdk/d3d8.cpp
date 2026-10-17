@@ -171,11 +171,64 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
     return hdr;
 }
 
+// XBE_STATE_VERIFY: deferred states that changed in the title's memory with no dirty flag set, which the gate below
+// would leave for a later draw; named, the first 32 render states and the first 32 texture stage states
+void Unflagged() {
+    static uint32_t rs_logged = 0, tss_logged = 0;
+    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++)
+        if (uint32_t v = R32(kRenderState + i * 4); v != g_state.rs[i] && rs_logged < 32) {
+            rs_logged++;
+            LOGR("d3d: deferred render state %u changed %08X -> %08X with no XDK dirty flag", i, g_state.rs[i], v);
+        }
+    for (uint32_t s = 0; s < 4; s++)
+        for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) {
+            uint32_t v = R32(kTextureState + (s * kStageStates + i) * 4);
+            if (v != g_state.tss[s][i] && tss_logged < 32) {
+                tss_logged++;
+                LOGR("d3d: texture stage %u state %u changed %08X -> %08X with no XDK dirty flag", s, i,
+                     g_state.tss[s][i], v);
+            }
+        }
+}
+
+// Deferred states live in the title's memory: its inlined SetRenderState and SetTextureStageState write them there and
+// set a bit of the XDK's dirty flags (the stage's bit, or the bits the library's table gives the render state), which
+// the library's draw takes and clears. A draw here takes them the same way: copied when a flag is set, g_state is new,
+// or a frame has been presented since the last copy, and marked only where they differ. Nothing else reads the flags:
+// the library's own state upload, the one code that does, runs only inside the draw calls done here instead. The
+// inlined writers set the flag before the value, as the XDK allows them: its Direct3D is called from one thread at a
+// time, so a draw never comes between the two. XBE_NO_DEFERRED_GATE (or XBE_NO_STATE_DIRTY) copies on every draw.
+// The flag word is not authoritative, though: XBE_STATE_VERIFY over a full session saw render state 127, the
+// presentation interval, change 1 -> 2 -> 1 -> 2 before the district loaded with no flag set. Nothing reads that
+// state today, but a state that is read could change the same way, so the presented-frame copy below is what keeps
+// such a change stale for at most one frame.
+bool g_deferred_new = true;  // g_state was reset: copy whatever the flags say
+bool g_deferred_due = true;  // Swap presented a frame since the last copy: compare even with no flag set
 void SyncDeferred() {
-    // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
-    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
-    for (int s = 0; s < 4; s++)
-        for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
+    static const bool gate = [] {
+        bool off = std::getenv("XBE_NO_DEFERRED_GATE") || std::getenv("XBE_NO_STATE_DIRTY");
+        if (off) LOGR("d3d: XBE_NO_DEFERRED_GATE or XBE_NO_STATE_DIRTY, the deferred states are copied on every draw");
+        return !off;
+    }();
+    static const bool verify = std::getenv("XBE_STATE_VERIFY") != nullptr;
+    if (gate) {
+        uint32_t flags = R32(kDirtyFlags);
+        if (!flags && !g_deferred_new) {
+            if (verify) Unflagged();  // and copied below, so the run draws as without the gate
+            else if (!g_deferred_due) return;
+        }
+        if (flags) W32(kDirtyFlags, 0);
+    }
+    auto copy = [](void* to, uint32_t from, size_t n) {
+        if (!std::memcmp(to, HostPtr(from), n)) return;
+        std::memcpy(to, HostPtr(from), n);
+        g_state.Mark(to, n);
+    };
+    copy(&g_state.rs[gpu::kRsDeferredFirst], kRenderState + gpu::kRsDeferredFirst * 4,
+         (gpu::kRsComplexFirst - gpu::kRsDeferredFirst) * 4);
+    for (uint32_t s = 0; s < 4; s++)
+        copy(g_state.tss[s].data(), kTextureState + s * kStageStates * 4, gpu::kTssBumpEnvMat00 * 4);
+    g_deferred_new = g_deferred_due = false;
 }
 
 float ZScale(const gpu::Surface& zs) {
@@ -218,6 +271,7 @@ void CentreVsConstant(uint32_t r) {
     float dx = FrameCentreShift();
     if (dx == 0) return;
     g_state.vsc[r][r == kVscFoldOffset ? 0 : 3] += dx;
+    g_state.Mark(g_state.vsc[r]);
 }
 
 // the vertex shader constants of one inline push packet: [kVscPush, register + 96, (dwords << 18) | kVscMethod,
@@ -225,12 +279,15 @@ void CentreVsConstant(uint32_t r) {
 constexpr uint32_t kVscPush = 0x41EA4;
 constexpr uint32_t kVscMethod = 0xB80;
 void StoreVsConstants(uint32_t reg, uint32_t n, uint32_t data) {
+    gpu::State::Marks marks;
     for (uint32_t i = 0; i + 4 <= n; i += 4) {
         uint32_t r = reg + i / 4;
         if (r >= kVscCount) continue;
         std::memcpy(g_state.vsc[r].data(), HostPtr(data + i * 4), 16);
+        g_state.Add(marks, g_state.vsc[r].data(), 16);
         CentreVsConstant(r);
     }
+    g_state.Mark(marks);
 }
 
 bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are the title's
@@ -238,12 +295,12 @@ bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are 
 // c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them
 void UpdateViewportConstants() {
     auto& v = g_state.viewport;
-    g_state.zscale = ZScale(g_state.zs);
+    g_state.Set(g_state.zscale, ZScale(g_state.zs));
     float hw = v.w * 0.5f, hh = v.h * 0.5f;
     if (!g_own_constants) {
-        g_state.vsc[58] = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
-        g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw + FrameCentreShift(),
-                           v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
+        g_state.Set(g_state.vsc[58], {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0});
+        g_state.Set(g_state.vsc[59], {v.x + g_state.ss_offset_x + hw + FrameCentreShift(),
+                                      v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0});
     }
     // the viewport as the library's SetViewport stores it, for inlined readers
     if (XDK_CDevice_Viewport != xdk::kUnknown) {
@@ -258,7 +315,7 @@ void UpdateViewportConstants() {
 }
 
 void SetComplex(uint32_t rs, uint32_t v) {
-    g_state.rs[rs] = v;
+    g_state.Set(g_state.rs[rs], v);
     W32(kRenderState + rs * 4, v);
 }
 
@@ -303,6 +360,7 @@ void VerticalBlank(X86Context& ctx) {
 
 }  // namespace
 
+// a write through it is marked after it (gpu::State::Set or Mark), or the render thread keeps the old value
 gpu::State& State() { return g_state; }
 std::recursive_mutex& Lock() { return g_lock; }
 
@@ -321,8 +379,11 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
                 XDK_KEY(CDevice_SuperSampleY), XDK_KEY(CDevice_Transforms), XDK_KEY(CDevice_Textures),
                 XDK_KEY(CDevice_RenderTarget), XDK_KEY(CDevice_Depth), XDK_KEY(CDevice_BackBuffer),
                 XDK_KEY(CDevice_FrontBuffer), XDK_KEY(CDevice_SwapCount), XDK_KEY(CDevice_Size),
-                XDK_KEY(DirtyFlags_Texture), XDK_KEY(TextureState_Stage), XDK_KEY(Stream_Size),
-                XDK_KEY(Stream_Stride), XDK_KEY(Stream_Buffer));
+                XDK_KEY(TextureState_Stage), XDK_KEY(Stream_Size), XDK_KEY(Stream_Stride), XDK_KEY(Stream_Buffer));
+    // SetTexture no longer sets D3D__DirtyFlags, whose only readers are the library's state upload under these replaced
+    // entry points: a title missing one would run that upload on flags that stay clear and lose texture state silently
+    XDK_REQUIRE("d3d", XDK_DATA(D3DDevice_DrawVertices), XDK_DATA(D3DDevice_DrawIndexedVertices),
+                XDK_DATA(D3DDevice_DrawVerticesUP), XDK_DATA(D3DDevice_Begin), XDK_DATA(D3DDevice_Swap));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t pp = a[4];  // D3DPRESENT_PARAMETERS
     uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
@@ -350,8 +411,9 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
-    g_state = gpu::State{};
-    g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    g_state = gpu::State{};  // all of it marked written
+    g_deferred_new = true;
+    g_state.Set(g_state.viewport, {0, 0, w, h, 0.0f, 1.0f});
     SetDev(kDevRenderTarget, g_buffers[1]);
     SetDev(kDevDepth, g_depth);
     SetDev(kDevBackBuffer, g_buffers[1]);
@@ -379,8 +441,8 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         if (!started) StartHostThread("vertical blank", VerticalBlank);
         started = true;
     }
-    g_state.rt = SurfaceOf(g_buffers[1]);
-    g_state.zs = SurfaceOf(g_depth);
+    g_state.Set(g_state.rt, SurfaceOf(g_buffers[1]));
+    g_state.Set(g_state.zs, SurfaceOf(g_depth));
     UpdateViewportConstants();
     ApplyDefaultStates(ctx);
     if (a[5]) W32(a[5], kDevice);
@@ -518,12 +580,12 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     AddRef(ctx, zs);
     Release(ctx, old_rt);
     Release(ctx, old_zs);
-    g_state.rt = SurfaceOf(rt);
-    g_state.zs = SurfaceOf(zs);
+    g_state.Set(g_state.rt, SurfaceOf(rt));
+    g_state.Set(g_state.zs, SurfaceOf(zs));
     // SetRenderTarget resets the viewport to the whole target
     uint32_t w, h;
     gpu::SurfaceSize(g_state.rt, w, h);
-    g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    g_state.Set(g_state.viewport, {0, 0, w, h, 0.0f, 1.0f});
     UpdateViewportConstants();
     return 0;
 }
@@ -580,6 +642,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         }
     }
     if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+    g_deferred_due = true;  // a frame was presented: the next draw compares the deferred states even with no flag set
     app::Pace();
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
     uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
@@ -589,7 +652,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     }
     W32(g_buffers[0] + 4, data);
     W32(g_buffers[0] + 8, lk);
-    g_state.rt = SurfaceOf(Dev(kDevRenderTarget));
+    g_state.Set(g_state.rt, SurfaceOf(Dev(kDevRenderTarget)));
     uint32_t n = Dev(kDevSwapCount) + 1;
     SetDev(kDevSwapCount, n);
     return n;
@@ -611,22 +674,23 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
-    g_state.scissor_count = 0;
+    g_state.Set(g_state.viewport, {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)});
+    g_state.Set(g_state.scissor_count, 0);
     UpdateViewportConstants();
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetScissors, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    g_state.scissor_count = std::min<uint32_t>(a[0], 8);
+    g_state.Set(g_state.scissor_count, std::min<uint32_t>(a[0], 8));
     for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(a[2] + i * 4);
+    g_state.Mark(g_state.scissors);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
-    g_state.ss_offset_x = ArgF(a, 0);
-    g_state.ss_offset_y = ArgF(a, 1);
+    g_state.Set(g_state.ss_offset_x, ArgF(a, 0));
+    g_state.Set(g_state.ss_offset_y, ArgF(a, 1));
     UpdateViewportConstants();
     return 0;
 }
@@ -635,7 +699,7 @@ HLE_STDCALL(D3DDevice_SetScreenSpaceOffset, 2) {
 
 HLE_FASTCALL(D3DDevice_SetRenderState_Simple, 0) {
     uint32_t method = a[0] & 0x1FFC, value = a[1];
-    g_state.simple[method >> 2] = value;
+    g_state.Set(g_state.simple[method >> 2], value);
     return 0;
 }
 
@@ -643,7 +707,7 @@ HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
     uint32_t rs = a[0], v = a[1];
     if (rs < gpu::kRsDeferredFirst) {
         uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
-        g_state.simple[method >> 2] = v;
+        g_state.Set(g_state.simple[method >> 2], v);
         W32(kRenderState + rs * 4, v);  // titles read their states back from the library's table
     } else if (rs < gpu::kRsMax) {
         SetComplex(rs, v);
@@ -687,26 +751,27 @@ COMPLEX_STATE(RopZRead, gpu::kRsRopZRead)
 COMPLEX_STATE(DoNotCullUncompressed, gpu::kRsDoNotCullUncompressed)
 
 HLE_STDCALL(D3DDevice_SetTextureState_TexCoordIndex, 2) {
-    g_state.tss[a[0] & 3][gpu::kTssTexCoordIndex] = a[1];
+    g_state.Set(g_state.tss[a[0] & 3][gpu::kTssTexCoordIndex], a[1]);
     W32(kTextureState + ((a[0] & 3) * kStageStates + gpu::kTssTexCoordIndex) * 4, a[1]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BumpEnv, 3) {
-    if (a[1] >= gpu::kTssBumpEnvMat00 && a[1] <= gpu::kTssBumpEnvLOffset) g_state.tss[a[0] & 3][a[1]] = a[2];
+    if (a[1] >= gpu::kTssBumpEnvMat00 && a[1] <= gpu::kTssBumpEnvLOffset)
+        g_state.Set(g_state.tss[a[0] & 3][a[1]], a[2]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_BorderColor, 2) {
-    g_state.tss[a[0] & 3][gpu::kTssBorderColor] = a[1];
+    g_state.Set(g_state.tss[a[0] & 3][gpu::kTssBorderColor], a[1]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureState_ColorKeyColor, 2) {
-    g_state.tss[a[0] & 3][gpu::kTssColorKeyColor] = a[1];
+    g_state.Set(g_state.tss[a[0] & 3][gpu::kTssColorKeyColor], a[1]);
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetTextureStageStateNotInline, 3) {
     uint32_t stage = a[0] & 3, type = a[1], v = a[2];
     if (type < gpu::kTssCount) {
-        g_state.tss[stage][type] = v;
+        g_state.Set(g_state.tss[stage][type], v);
         W32(kTextureState + (stage * kStageStates + type) * 4, v);
     }
     return 0;
@@ -720,11 +785,13 @@ HLE_STDCALL(D3DDevice_SetTransform, 2) {
     std::memcpy(HostPtr(kDevice + kDevTransforms + t * 64), HostPtr(a[1]), 64);
     uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
     std::memcpy(g_state.transforms[pc].data(), HostPtr(a[1]), 64);
+    g_state.Mark(g_state.transforms[pc]);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SetMaterial, 1) {
     std::memcpy(g_state.material.data(), HostPtr(a[0]), 17 * 4);
+    g_state.Mark(g_state.material);
     return 0;
 }
 
@@ -734,13 +801,14 @@ HLE_WRAP(D3DDevice_SetLight, 2) {
     if (i < 8 && l) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         std::memcpy(g_state.lights[i].data(), HostPtr(l), 26 * 4);
+        g_state.Mark(g_state.lights[i]);
     }
 }
 HLE_WRAP(D3DDevice_LightEnable, 2) {
     uint32_t i = a[0], on = a[1];
     if (i < 8) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
-        g_state.light_enable = on ? g_state.light_enable | 1u << i : g_state.light_enable & ~(1u << i);
+        g_state.Set(g_state.light_enable, on ? g_state.light_enable | 1u << i : g_state.light_enable & ~(1u << i));
     }
 }
 
@@ -753,8 +821,10 @@ HLE_STDCALL(D3DDevice_SetTexture, 2) {
     AddRef(ctx, tex);
     SetDev(kDevTextures + stage * 4, tex);
     Release(ctx, old);
-    g_state.textures[stage] = tex;
-    W32(kDirtyFlags, R32(kDirtyFlags) | XDK_DirtyFlags_Texture);
+    g_state.Set(g_state.textures[stage], tex);
+    // The XDK's SetTexture also sets D3D__DirtyFlags 0x4800 for its draw's state upload (LazySetState), which never
+    // runs here: the draws are this file's, and the one reader of the flags left is SyncDeferred, which a texture's
+    // flag would only send to copy unchanged deferred states.
     return 0;
 }
 
@@ -767,7 +837,7 @@ HLE_STDCALL(D3DDevice_SetPalette, 2) {
     AddRef(ctx, pal);
     SetDev(kDevPalettes + stage * 4, pal);
     Release(ctx, old);
-    g_state.palettes[stage] = pal;
+    g_state.Set(g_state.palettes[stage], pal);
     return 0;
 }
 
@@ -783,7 +853,7 @@ HLE_FASTCALL(D3DDevice_SwitchTexture, 1) {
     if (cur && cur != h) std::memcpy(HostPtr(h), HostPtr(cur), 20);
     W32(h + 4, a[1]);
     W32(h + 12, a[2]);
-    g_state.textures[stage] = h;
+    g_state.Set(g_state.textures[stage], h);
     return 0;
 }
 
@@ -795,7 +865,7 @@ HLE_STDCALL(D3DDevice_SetStreamSource, 3) {
     W32(kStreams + n * kStreamSize + XDK_Stream_Stride, stride);
     W32(kStreams + n * kStreamSize + XDK_Stream_Buffer, vb);
     Release(ctx, old);
-    g_state.streams[n] = {vb, stride};
+    g_state.Set(g_state.streams[n], {vb, stride});
     return 0;
 }
 
@@ -809,9 +879,9 @@ HLE_STDCALL(D3DDevice_SetIndices, 2) {
     SetDev(kDevIndexBuffer, ib);
     SetDev(kDevBaseVertex, a[1]);
     Release(ctx, old);
-    g_state.index_buffer = ib;
-    g_state.index_data = ib ? R32(ib + 4) : 0;
-    g_state.base_vertex = a[1];
+    g_state.Set(g_state.index_buffer, ib);
+    g_state.Set(g_state.index_data, ib ? R32(ib + 4) : 0);
+    g_state.Set(g_state.base_vertex, a[1]);
     return 0;
 }
 
@@ -871,16 +941,16 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t h = a[0];
-    g_state.vs_handle = h;
-    g_state.vs = nullptr;
+    g_state.Set(g_state.vs_handle, h);
+    g_state.Set(g_state.vs, nullptr);
     if (h & 1) {
         auto it = g_vs.find(h);
         if (it != g_vs.end()) {
-            g_state.vs = it->second;
+            g_state.Set(g_state.vs, it->second);
             // constants declared with the shader load when it is selected
             for (auto& [reg, v] : it->second->constants)
                 if (reg < kVscCount) {
-                    g_state.vsc[reg] = v;
+                    g_state.Set(g_state.vsc[reg], v);
                     CentreVsConstant(reg);
                 }
         } else {
@@ -895,10 +965,13 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
 // SetVertexShaderConstantNotInlineFast; the host only needs its own constant copy.
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1Fast, 1) {
     uint32_t reg = a[0], src = a[1], dwords = a[2];
+    gpu::State::Marks marks;
     for (uint32_t i = 0; i < dwords / 4 && reg + i < kVscCount; i++) {
         std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        g_state.Add(marks, g_state.vsc[reg + i].data(), 16);
         CentreVsConstant(reg + i);
     }
+    g_state.Mark(marks);
     return 0;
 }
 
@@ -906,6 +979,7 @@ HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
     uint32_t reg = a[0];
     if (reg < kVscCount) {
         std::memcpy(g_state.vsc[reg].data(), HostPtr(a[1]), 16);
+        g_state.Mark(g_state.vsc[reg]);
         CentreVsConstant(reg);
     }
     return 0;
@@ -913,19 +987,25 @@ HLE_FASTCALL(D3DDevice_SetVertexShaderConstant1, 0) {
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstant4, 0) {
     uint32_t reg = a[0], src = a[1];
+    gpu::State::Marks marks;
     for (uint32_t i = 0; i < 4 && reg + i < kVscCount; i++) {
         std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        g_state.Add(marks, g_state.vsc[reg + i].data(), 16);
         CentreVsConstant(reg + i);
     }
+    g_state.Mark(marks);
     return 0;
 }
 
 HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
     uint32_t reg = a[0], src = a[1], dwords = a[2];
+    gpu::State::Marks marks;
     for (uint32_t i = 0; i < dwords / 4 && reg + i < kVscCount; i++) {
         std::memcpy(g_state.vsc[reg + i].data(), HostPtr(src + i * 16), 16);
+        g_state.Add(marks, g_state.vsc[reg + i].data(), 16);
         CentreVsConstant(reg + i);
     }
+    g_state.Mark(marks);
     return 0;
 }
 
@@ -963,11 +1043,11 @@ HLE_STDCALL(D3DDevice_DeletePixelShader, 1) {
 
 HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    g_state.ps = nullptr;
+    g_state.Set(g_state.ps, nullptr);
     if (!a[0]) return 0;
     auto it = g_ps.find(a[0]);
     if (it != g_ps.end()) {
-        g_state.ps = it->second;
+        g_state.Set(g_state.ps, it->second);
     } else if (XDK_PixelShader_Definition != xdk::kUnknown) {
         // made by library code the title inlined: the object points at its definition, handles are reused
         static std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> made;
@@ -978,14 +1058,18 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
             ps->handle = a[0];
             std::memcpy(ps->def, def, sizeof(ps->def));
         }
-        g_state.ps = ps;
+        g_state.Set(g_state.ps, ps);
     } else {
         LOG_FIRST(8, "d3d: SetPixelShader with unknown handle %08X", a[0]);
         return 0;
     }
-    // the definition loads the combiner state like the XDK pushes it
+    // the definition loads the combiner state like the XDK pushes it, marked at once after the last write
     const uint32_t* d = g_state.ps->def;
-    auto put = [&](uint32_t method, uint32_t v) { g_state.simple[method >> 2] = v; };
+    gpu::State::Marks marks;
+    auto put = [&](uint32_t method, uint32_t v) {
+        g_state.simple[method >> 2] = v;
+        g_state.Add(marks, &g_state.simple[method >> 2], 4);
+    };
     for (int i = 0; i < 8; i++) {
         put(gpu::kMPsAlphaInputs + i * 4, d[0 + i]);
         put(gpu::kMPsConstant0 + i * 4, d[10 + i]);
@@ -1002,6 +1086,7 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
     put(gpu::kMPsCombinerCount, d[53]);
     put(gpu::kMPsDotMapping, d[55]);
     put(gpu::kMPsInputTexture, d[56]);
+    g_state.Mark(marks);
     SetComplex(gpu::kRsPsTextureModes, d[54]);
     return 0;
 }
@@ -1009,7 +1094,12 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
 HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0], src = a[1], n = a[2];
-    for (uint32_t i = 0; i < n && reg + i < 16; i++) std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
+    gpu::State::Marks marks;
+    for (uint32_t i = 0; i < n && reg + i < 16; i++) {
+        std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
+        g_state.Add(marks, g_state.psc[reg + i].data(), 16);
+    }
+    g_state.Mark(marks);
     gpu::ApplyPixelConstants(g_state, reg, n);
     return 0;
 }
@@ -1068,9 +1158,9 @@ void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride
     Walk(Dev(kDevPush));  // constants/attributes pushed inline since the last drain apply to this draw
     SyncDeferred();
     auto stream = g_state.streams[0];
-    g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
+    g_state.Set(g_state.streams[0], {UpVertices(vertices, count * stride), stride});
     g_backend->Draw(g_state, prim, 0, count, nullptr);
-    g_state.streams[0] = stream;
+    g_state.Set(g_state.streams[0], stream);
 }
 
 // bytes per vertex of the bound format: stream 0 of the FVF or of the shader's declaration
@@ -1122,11 +1212,11 @@ void EndPrimitive() {
     for (uint32_t v = 0; v < count; v++)
         for (uint32_t s = 0; s < 16; s++)
             if (g_im_mask >> s & 1) packed.insert(packed.end(), &g_im_vertices[v * 64 + s * 4], &g_im_vertices[v * 64 + s * 4] + 4);
-    g_state.vs = m.vs;
-    g_state.vs_handle = handle | 1;
+    g_state.Set(g_state.vs, m.vs);
+    g_state.Set(g_state.vs_handle, handle | 1);
     DrawUp(prim, count, packed.data(), m.vs->stream_stride[0]);
-    g_state.vs = bound;
-    g_state.vs_handle = handle;
+    g_state.Set(g_state.vs, bound);
+    g_state.Set(g_state.vs_handle, handle);
 }
 
 // reads the commands pushed since the last call: vertex data between a begin and an end is drawn, the rest is skipped
@@ -1241,7 +1331,7 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
             if (m == kInlineArray) {
                 if (prim) vertices.push_back(v);
             } else if (m != kBeginEnd) {
-                if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
+                if (m >> 2 < g_state.simple.size()) g_state.Set(g_state.simple[m >> 2], v);
             } else if (v) {
                 prim = v;
                 vertices.clear();
