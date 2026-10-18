@@ -31,6 +31,8 @@ struct NamedAspect {
 const NamedAspect kAspects[] = {{"auto", 0.0f},           {"4:3", 4.0f / 3.0f},   {"16:9", 16.0f / 9.0f},
                                 {"16:10", 16.0f / 10.0f}, {"21:9", 21.0f / 9.0f}, {"32:9", 32.0f / 9.0f}};
 
+const char* kHdrModes[] = {"off", "auto", "on"};  // HdrMode's order
+
 // the chosen entry's index, auto for a name this build does not know
 uint32_t ChosenAspect() {
     const std::string& key = Get().aspect_ratio;
@@ -70,6 +72,12 @@ void Load() {
         if (aspect == a.key) s.aspect_ratio = aspect;
     s.ultrawide = t["ultrawide"].value_or(s.ultrawide);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    // a file from before HDR has none of these: off, and the rest as they default
+    std::string hdr = t["hdr"].value_or(s.hdr);
+    for (const char* m : kHdrModes)
+        if (hdr == m) s.hdr = hdr;
+    s.hdr_paper_white = t["hdr_paper_white"].value_or(s.hdr_paper_white);
+    s.hdr_peak = t["hdr_peak"].value_or(s.hdr_peak);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -90,7 +98,10 @@ toml::table Table() {
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"aspect_ratio", s.aspect_ratio},
                   {"ultrawide", s.ultrawide},
-                  {"join_ip", s.join_ip}};
+                  {"join_ip", s.join_ip},
+                  {"hdr", s.hdr},
+                  {"hdr_paper_white", int64_t(s.hdr_paper_white)},
+                  {"hdr_peak", int64_t(s.hdr_peak)}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));
@@ -179,6 +190,39 @@ float TargetAspect() { return Shaped().target; }
 float RenderScale(uint32_t guest_height) {
     float h = Output().height * (Get().render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+}
+
+HdrMode HdrWanted() {
+    const std::string& m = Get().hdr;
+    for (uint32_t i = 1; i < std::size(kHdrModes); i++)
+        if (m == kHdrModes[i]) return HdrMode(i);
+    return HdrMode::Off;
+}
+
+// Windows shows SDR content in HDR at 80 to 480 nits; below 80 the game would be dimmer than scRGB's own white
+uint32_t PaperWhiteNits() { return std::clamp(Get().hdr_paper_white, 80u, 480u); }
+
+// 10000 nits is where PQ, the signal an HDR display is sent, ends
+uint32_t PeakNits() {
+    uint32_t p = Get().hdr_peak;
+    return p ? std::clamp(p, 80u, 10000u) : 0;
+}
+
+namespace {
+
+std::mutex g_hdr_lock;  // the renderer sets the status, the UI reads it
+HdrStatus g_hdr{false, false, 0, "the display was not looked at yet"};
+
+}  // namespace
+
+HdrStatus Hdr() {
+    std::lock_guard lock(g_hdr_lock);
+    return g_hdr;
+}
+
+void SetHdr(const HdrStatus& s) {
+    std::lock_guard lock(g_hdr_lock);
+    g_hdr = s;
 }
 
 }  // namespace app

@@ -59,6 +59,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **Direct3D 8** - Implements Direct3D 8 as the XDK does it, including immediate mode draws, palettes, gamma ramps and Direct3D code built into the game.
 - **Native Direct3D 12 Renderer** - Translates the Xbox's vertex programs, pixel combiners and fixed function pipeline to HLSL, with rendering on its own thread.
 - **Shader Cache** - Compiles shaders and pipelines on worker threads and keeps them in a `shadercache` folder beside the exe between runs; pipeline blobs are only reused on the adapter and driver that made them.
+- **HDR Output** - Presents through an HDR swap chain when `hdr` in the settings file is `auto` (only when the window's display has HDR on in Windows) or `on`, mapping the game's SDR image so its white lands at `hdr_paper_white` nits and highlights stay within `hdr_peak` (0 takes the display's own maximum). `off`, the default, keeps the SDR swap chain and present exactly as before. What the swap chain ended up as, and why, is `app::Hdr()`, for a game's settings UI to show.
 - **Renderer Extensions** - Allows a game to change render targets, add passes and add to the generated shaders through `gpu::Extension`, set with `gpu::SetExtension` from `GameInfo::init`.
 
 ### Audio

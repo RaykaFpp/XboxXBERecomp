@@ -26,6 +26,10 @@ struct Settings {
     std::string aspect_ratio = "auto";
     bool ultrawide = true;  // false: the frame stays 16:9 and every number below is exactly what it was
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    // HDR output (gpu/d3d12.cpp): off never, auto when the window's display is in HDR in Windows, on always
+    std::string hdr = "off";
+    uint32_t hdr_paper_white = 200;  // nits the game's white is shown at in HDR
+    uint32_t hdr_peak = 0;           // nits nothing goes past in HDR, 0 the display's own maximum
 };
 
 Settings& Get();
@@ -48,6 +52,23 @@ bool Widescreen();
 float AspectWiden();
 // the aspect the frame is presented at: the widened 16:9 on a widescreen output, else 4:3
 float TargetAspect();
+
+// HDR output: the settings read each present, so a change shows at once without app::ApplyDisplay
+enum class HdrMode { Off, Auto, On };
+HdrMode HdrWanted();        // the setting, parsed: anything but "auto" and "on" is off
+uint32_t PaperWhiteNits();  // the setting, clamped to 80-480 nits, the range Windows offers SDR content in HDR
+uint32_t PeakNits();        // the setting, 0 means the display decides, else clamped to 80-10000 nits
+// set by the renderer each time the swap chain is made or the window's display changes, read by the UI
+struct HdrStatus {
+    bool active;                // the swap chain is FP16 scRGB
+    bool display_capable;       // the window's display is in HDR in Windows: DXGI reports it in PQ
+    uint32_t display_max_nits;  // that display's peak as it reports it, also when HDR is off; 0 unknown
+    // never null, lowercase without a full stop: why HDR is off, or, active on a display Windows runs in SDR, why
+    // the picture stays at SDR brightness; "" when active on an HDR display
+    const char* why;
+};
+HdrStatus Hdr();
+void SetHdr(const HdrStatus&);
 
 std::filesystem::path ExeDir();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc

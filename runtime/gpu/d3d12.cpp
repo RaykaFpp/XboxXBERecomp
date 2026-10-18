@@ -155,6 +155,99 @@ O vs(uint id : SV_VertexID) {
 float psmain(O i) : SV_Depth { return img.SampleLevel(ps, i.uv, 0); }
 )";
 
+// HDR output is FP16 scRGB (linear, BT.709 primaries, 1.0 = 80 nits), not 10 bit PQ with BT.2020 primaries. The game is
+// 8 bit sRGB in BT.709: into scRGB it is decoded and multiplied, where PQ adds a primaries matrix and an encode, two more
+// places for hues or tones to slip. And DWM takes scRGB to any display: one Windows runs in SDR shows its 0 to 1 and
+// clips the rest (Microsoft, "Use DirectX with Advanced Color on high/standard dynamic range displays"), so the window
+// dragged onto an SDR display shows a sane picture until the swap chain follows it, where a PQ swap chain is meant for
+// HDR displays only. The cost, 8 bytes a pixel against 4, is one write a pixel a frame.
+constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr DXGI_COLOR_SPACE_TYPE kHdrSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+constexpr float kScrgbNits = 80;  // scRGB 1.0
+
+// HDR output's pass (DrawHdr): the SDR composite, the frame through the title's gamma ramp with the overlay and the HUD
+// drawn over it, exactly what the SDR swap chain shows, into scRGB.
+// - Decoded with a 2.2 power, as an SDR display shows those 8 bit values: the sRGB curve's straight toe puts the darkest
+//   steps several times higher (code 10: 0.0030 against 0.0008) and greys the blacks. On a display Windows runs in SDR
+//   (tone.y 0) the sRGB curve instead, so DWM's encode back to SDR gives the SDR picture unchanged.
+// - Multiplied by tone.x, which puts SDR white on the paper white. Nothing is expanded or saturated: the picture has the
+//   game's own detail and colours, at a chosen brightness.
+// - Kept inside the peak when the paper white is past it: the brightest channel rolls off along BT.2390's shoulder,
+//   shaped in PQ, and the other two follow it, so a colour keeps its hue. tone.z is where the shoulder starts and roll.x
+//   where it ends at the peak, as PQ over the paper white's PQ (tone.w); tone.z of 1 or more is no shoulder.
+const char* kHdrHlsl = R"(
+cbuffer B : register(b1) { float4 tone; float4 roll; };
+Texture2D img : register(t0);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+static const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+float Pq(float nits) {
+    float y = pow(nits / 10000, m1);
+    return pow((c1 + c2 * y) / (1 + c3 * y), m2);
+}
+float Nits(float e) {
+    float x = pow(e, 1 / m2);
+    return 10000 * pow(max(x - c1, 0) / (c2 - c3 * x), 1 / m1);
+}
+float4 psmain(O i) : SV_Target {
+    float3 c = img.Load(int3(i.p.xy, 0)).rgb;
+    float3 l = tone.y > 0 ? pow(c, 2.2) : (c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4));
+    l *= tone.x;
+    if (tone.z < 1) {
+        float m = max(l.r, max(l.g, l.b));
+        float e = Pq(m * 80) / tone.w;
+        if (e > tone.z) {
+            float t = (e - tone.z) / (1 - tone.z), t2 = t * t, t3 = t2 * t;
+            e = (2 * t3 - 3 * t2 + 1) * tone.z + (t3 - 2 * t2 + t) * (1 - tone.z) + (3 * t2 - 2 * t3) * roll.x;
+            l *= Nits(e * tone.w) / (m * 80);
+        }
+    }
+    return float4(l, 1);
+}
+)";
+
+// SMPTE ST 2084, nits to PQ's 0 to 1 signal: kHdrHlsl's Pq
+float Pq(float nits) {
+    constexpr float m1 = 2610.0f / 16384, m2 = 2523.0f / 4096 * 128;
+    constexpr float c1 = 3424.0f / 4096, c2 = 2413.0f / 4096 * 32, c3 = 2392.0f / 4096 * 32;
+    float y = std::pow(nits / 10000, m1);
+    return std::pow((c1 + c2 * y) / (1 + c3 * y), m2);
+}
+
+// the colour space DXGI reports for a display Windows runs in HDR
+bool IsPq(DXGI_COLOR_SPACE_TYPE c) {
+    return c == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || c == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+}
+
+const char* SpaceName(DXGI_COLOR_SPACE_TYPE c) {
+    switch (c) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: return "sRGB, SDR";
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: return "PQ BT.2020, HDR";
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020: return "PQ BT.2020 studio range, HDR";
+        default: return "other";
+    }
+}
+
+const char* const kHdrModeNames[] = {"off", "auto", "on"};  // app::HdrMode's order, as the settings file has them
+
+// the output showing the monitor, from any of the factory's adapters; null when none does
+ComPtr<IDXGIOutput> FindOutput(IDXGIFactory1* f, HMONITOR monitor) {
+    ComPtr<IDXGIAdapter1> a;
+    for (UINT i = 0; SUCCEEDED(f->EnumAdapters1(i, a.ReleaseAndGetAddressOf())); i++) {
+        ComPtr<IDXGIOutput> o;
+        for (UINT k = 0; SUCCEEDED(a->EnumOutputs(k, o.ReleaseAndGetAddressOf())); k++) {
+            DXGI_OUTPUT_DESC d;
+            if (SUCCEEDED(o->GetDesc(&d)) && d.Monitor == monitor) return o;
+        }
+    }
+    return nullptr;
+}
+
 float Bits(uint32_t v) {
     float f;
     std::memcpy(&f, &v, 4);
@@ -570,14 +663,26 @@ private:
     void CreateFrames();
     void CreateGammaLut();
     void LoadSettings();
-    // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
+    // Present, in call order, each callee right after its caller; DrawFrame runs Compose, which runs the two after it,
+    // and DrawHdr
     void FinishCapture(const Surface& front);
     void StartCapture();
     void ResizeSwap();
+    // ResizeSwap's HDR output steps, in call order (Init runs QueryDisplay and ReportOutput with HDR off)
+    bool DisplayChanged(HWND hwnd) const;
+    void RemakeSwap(HWND hwnd, uint32_t w, uint32_t h, app::HdrMode want);
+    void ReleaseComposite();
+    bool QueryDisplay(HWND hwnd);
+    IDXGIFactory1* CurrentFactory();
+    bool MakeComposite(uint32_t w, uint32_t h);
+    void ReportOutput(app::HdrMode want, bool known, const char* why, HRESULT hr);
+    void MappingText(char* out, size_t n) const;
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
+    void Compose(Target* t, D3D12_CPU_DESCRIPTOR_HANDLE rh);
     void BlitFrame(Target& t);
     void RenderUi();
+    void DrawHdr(D3D12_CPU_DESCRIPTOR_HANDLE rh);
     void ReleaseOldTextures();
     void ResetFrame();
     void CountFps();
@@ -754,6 +859,22 @@ private:
     std::atomic<uint64_t> presents_seen_{0};    // presents_ for DeliverLate
     Assembled asm_;  // kept between draws for its buffers
     bool tearing_ = false;
+    // HDR output (RemakeSwap): the setting the swap chain was last made for and what came of it
+    app::HdrMode hdr_wanted_ = app::HdrMode::Off;
+    bool hdr_ = false;        // the swap chain is kHdrFormat in kHdrSpace: DrawFrame composes into sdr_ for DrawHdr
+    bool hdr_sdr_ = false;    // ... forced on a display Windows runs in SDR, whose own white is scRGB 1.0
+    bool space_set_ = false;  // SetColorSpace1 set kHdrSpace: an 8 bit swap chain gets sRGB set back
+    DXGI_OUTPUT_DESC1 display_{};               // the window's display as DXGI last described it, zero when unknown
+    HMONITOR window_monitor_ = nullptr;         // the window's monitor then
+    IDXGIFactory1* display_factory_ = nullptr;  // the factory display_ came from, factory_ or outputs_
+    bool display_current_ = false;              // ... and it was current then
+    ComPtr<IDXGIFactory1> outputs_;             // a fresh factory once factory_ is stale (CurrentFactory)
+    ComPtr<ID3D12Resource> sdr_;                // the SDR composite, back buffer sized, kBgra
+    D3D12_RESOURCE_STATES sdr_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    uint32_t sdr_view_ = 0;
+    uint32_t map_white_ = 0;  // PaperWhiteNits and PeakNits as last logged
+    uint32_t map_peak_ = 0;
+    std::string output_log_;  // ReportOutput's lines as last logged
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -775,6 +896,10 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
     Begin();
+    // HDR off: the swap chain stays as made and the display is only looked at; wanted, the first present remakes it
+    if (app::HdrWanted() == app::HdrMode::Off) {
+        ReportOutput(app::HdrMode::Off, QueryDisplay(hwnd), "turned off in settings", S_OK);
+    }
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
 }
@@ -2855,16 +2980,183 @@ void D3D12Backend::ResizeSwap() {
     GetClientRect(hwnd, &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (w == bb_w_ && h == bb_h_) return;
+    // remade for a new HDR setting too, and while HDR is wanted for the window's display; with HDR off only a new size
+    // gets past here, as before
+    app::HdrMode want = app::HdrWanted();
+    bool same = w == bb_w_ && h == bb_h_ && want == hdr_wanted_;
+    if (same && (want == app::HdrMode::Off || !DisplayChanged(hwnd))) return;
     Flush();
     for (auto& f : frames_) {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    RemakeSwap(hwnd, w, h, want);
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
+}
+
+// the window went to another monitor, or DXGI's displays changed since display_ was read (HDR switched in Windows, a
+// display plugged, moved or set to another mode): Microsoft's Advanced Color guide has a desktop render loop ask
+// IsCurrent each frame for that. A factory already stale when display_ was read (no fresh one could be made) is not.
+bool D3D12Backend::DisplayChanged(HWND hwnd) const {
+    if (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != window_monitor_) return true;
+    return display_current_ && !display_factory_->IsCurrent();
+}
+
+// the swap chain, its back buffers released, remade w x h in the format and colour space the HDR setting and the
+// window's display ask for: on always tries HDR, auto on a display Windows runs in HDR. A step failing leaves it SDR,
+// saying why. With HDR off this is the ResizeBuffers it always was, the display only looked at.
+void D3D12Backend::RemakeSwap(HWND hwnd, uint32_t w, uint32_t h, app::HdrMode want) {
+    hdr_wanted_ = want;
+    ReleaseComposite();
+    bool known = QueryDisplay(hwnd);
+    bool pq = known && IsPq(display_.ColorSpace);
+    UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    const char* why = want == app::HdrMode::Off ? "turned off in settings"
+                      : known                   ? "this display is SDR or has HDR off in Windows"
+                                                : "the display could not be queried";
+    HRESULT hr = S_OK;
+    UINT support = 0;
+    hdr_ = false;
+    if (want == app::HdrMode::On || (want == app::HdrMode::Auto && pq)) {
+        if (!MakeComposite(w, h)) {
+            why = "the HDR pass could not be set up";
+        } else if (FAILED(hr = swap_->ResizeBuffers(kFrames, w, h, kHdrFormat, flags))) {
+            why = "the HDR swap chain could not be made";
+        } else if (FAILED(hr = swap_->CheckColorSpaceSupport(kHdrSpace, &support)) ||
+                   !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) ||
+                   FAILED(hr = swap_->SetColorSpace1(kHdrSpace))) {
+            why = "the swap chain refused the HDR colour space";
+        } else {
+            hdr_ = space_set_ = true;
+        }
+    }
+    hdr_sdr_ = hdr_ && known && !pq;
+    if (!hdr_) {
+        ReleaseComposite();
+        swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, flags);
+        // set back explicitly: ResizeBuffers is not documented to undo what SetColorSpace1 set
+        if (space_set_ && SUCCEEDED(swap_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709))) space_set_ = false;
+    }
+    ReportOutput(want, known, why, hr);
+}
+
+// sdr_'s view back to the pool, the texture released with the frame as a target's is
+void D3D12Backend::ReleaseComposite() {
+    if (!sdr_) return;
+    free_rtv_.push_back(sdr_view_);
+    CurrentFrame().garbage.push_back(std::move(sdr_));
+}
+
+// the window's display as DXGI describes it now, into display_: the swap chain's containing output while the factory
+// that made the swap chain is current (CurrentFactory), else the output showing the window's monitor; false, display_
+// zero, when there is none
+bool D3D12Backend::QueryDisplay(HWND hwnd) {
+    window_monitor_ = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    display_factory_ = CurrentFactory();
+    display_current_ = display_factory_->IsCurrent();
+    ComPtr<IDXGIOutput> out;
+    if (display_factory_ == factory_.Get()) swap_->GetContainingOutput(&out);
+    if (!out) out = FindOutput(display_factory_, window_monitor_);
+    ComPtr<IDXGIOutput6> o6;
+    if (out && SUCCEEDED(out.As(&o6)) && SUCCEEDED(o6->GetDesc1(&display_))) return true;
+    display_ = {};
+    return false;
+}
+
+// a factory whose outputs describe the displays as they are. DXGI keeps output descriptions in the factory, and once
+// IsCurrent turns false its outputs, the swap chain's containing output among them, describe the displays as they
+// were; Microsoft's Advanced Color guide reads them from a fresh factory then, where remaking the swap chain for a
+// fresh containing output would blank the screen. factory_ stays: the device and the swap chain came from it.
+IDXGIFactory1* D3D12Backend::CurrentFactory() {
+    if (factory_->IsCurrent()) return factory_.Get();
+    if (!outputs_ || !outputs_->IsCurrent()) {
+        outputs_.Reset();
+        CreateDXGIFactory2(0, IID_PPV_ARGS(&outputs_));
+    }
+    return outputs_ ? outputs_.Get() : factory_.Get();
+}
+
+// sdr_ w x h with its view, HDR output's pipeline made first: false when any of them cannot be
+bool D3D12Backend::MakeComposite(uint32_t w, uint32_t h) {
+    if (!EnsurePassPipeline(kHdrHlsl, "psmain", kHdrFormat, -1) || free_rtv_.empty()) return false;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, w, h);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = kBgra;
+    cv.Color[3] = 1;  // Compose's black
+    sdr_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, sdr_state_, &cv, IID_PPV_ARGS(&sdr_)))) {
+        return false;
+    }
+    sdr_view_ = free_rtv_.back();
+    free_rtv_.pop_back();
+    dev_->CreateRenderTargetView(sdr_.Get(), nullptr, Cpu(rtv_heap_.Get(), sdr_view_, rtv_inc_));
+    return true;
+}
+
+// what the swap chain made of the HDR setting on the window's display: told to the UI, and the display and the outcome
+// logged when either changed, so a resize that changes neither logs nothing
+void D3D12Backend::ReportOutput(app::HdrMode want, bool known, const char* why, HRESULT hr) {
+    bool pq = known && IsPq(display_.ColorSpace);
+    const char* status = !hdr_   ? why
+                         : pq    ? ""
+                         : known ? "forced on, but this display is SDR or has HDR off in Windows"
+                                 : "forced on, the display could not be queried";
+    app::SetHdr({hdr_, pq, uint32_t(std::lround(display_.MaxLuminance)), status});
+    char shown[256];
+    if (known) {
+        const RECT& r = display_.DesktopCoordinates;
+        snprintf(shown, sizeof(shown),
+                 "d3d12: display %ls %ldx%ld, colour space %d (%s), luminance min %.4f max %.1f full frame %.1f nits",
+                 display_.DeviceName, r.right - r.left, r.bottom - r.top, int(display_.ColorSpace),
+                 SpaceName(display_.ColorSpace), display_.MinLuminance, display_.MaxLuminance,
+                 display_.MaxFullFrameLuminance);
+    } else {
+        snprintf(shown, sizeof(shown), "d3d12: display: DXGI has no output for the window");
+    }
+    char made[320];
+    const char* mode = kHdrModeNames[uint32_t(want)];
+    if (!hdr_) {
+        int n = std::min(snprintf(made, sizeof(made), "d3d12: HDR off (setting %s): %s, B8G8R8A8_UNORM swap chain",
+                                  mode, why),
+                         int(sizeof(made)) - 1);
+        if (FAILED(hr)) snprintf(made + n, sizeof(made) - n, ", hr %08lX", (unsigned long)hr);
+    } else if (hdr_sdr_) {
+        snprintf(made, sizeof(made),
+                 "d3d12: HDR on (setting %s): R16G16B16A16_FLOAT scRGB swap chain on a display in SDR, game white at "
+                 "the display's own white",
+                 mode);
+    } else {
+        int n = std::min(snprintf(made, sizeof(made), "d3d12: HDR on (setting %s): R16G16B16A16_FLOAT scRGB swap chain, ",
+                                  mode),
+                         int(sizeof(made)) - 1);
+        MappingText(made + n, sizeof(made) - n);
+        map_white_ = app::PaperWhiteNits();
+        map_peak_ = app::PeakNits();
+    }
+    std::string lines = std::string(shown) + '\n' + made;
+    if (lines == output_log_) return;
+    output_log_ = std::move(lines);
+    LOGR("%s", shown);
+    LOGR("%s", made);
+}
+
+// the HDR mapping the settings and the display give now, for the log
+void D3D12Backend::MappingText(char* out, size_t n) const {
+    uint32_t white = app::PaperWhiteNits();
+    uint32_t setting = app::PeakNits();
+    float peak = setting ? float(setting) : display_.MaxLuminance;
+    const char* roll = peak > 0 && float(white) > peak ? ", the top of the range rolled off into it" : "";
+    if (setting) {
+        snprintf(out, n, "game white %u nits, peak %u nits (hdr_peak)%s", white, setting, roll);
+    } else if (peak > 0) {
+        snprintf(out, n, "game white %u nits, peak %.1f nits (the display's)%s", white, peak, roll);
+    } else {
+        snprintf(out, n, "game white %u nits, no peak (the display reports none)", white);
+    }
 }
 
 void D3D12Backend::FinishCapture(const Surface& front) {
@@ -3132,13 +3424,58 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
+    if (hdr_) {
+        // HDR: composed in SDR into sdr_, ImGui and all, exactly as into an SDR back buffer, then mapped into this one:
+        // the game, a movie, the overlay and the HUD reach HDR through the one mapping, SDR white on the paper white
+        Transition(sdr_.Get(), sdr_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Compose(t, Cpu(rtv_heap_.Get(), sdr_view_, rtv_inc_));
+        DrawHdr(rh);
+    } else {
+        Compose(t, rh);
+    }
+    Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
+}
+
+// the picture the SDR swap chain shows, into rh: cleared black, the frame, the overlay and the HUD over it
+void D3D12Backend::Compose(Target* t, D3D12_CPU_DESCRIPTOR_HANDLE rh) {
     float black[4] = {0, 0, 0, 1};
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
     RenderUi();
-    Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
+}
+
+// HDR output: sdr_ into the back buffer through kHdrHlsl, with the settings as they are this present, so the panel's
+// paper white and peak show at once
+void D3D12Backend::DrawHdr(D3D12_CPU_DESCRIPTOR_HANDLE rh) {
+    float k[8] = {1, 0, 2, 0, 0, 0, 0, 0};  // on a display in SDR: its own white at scRGB 1.0, the sRGB curve
+    if (!hdr_sdr_) {
+        uint32_t white = app::PaperWhiteNits();
+        uint32_t setting = app::PeakNits();
+        if (white != map_white_ || setting != map_peak_) {
+            map_white_ = white;
+            map_peak_ = setting;
+            char text[160];
+            MappingText(text, sizeof(text));
+            LOGR("d3d12: HDR %s", text);
+        }
+        float peak = setting ? float(setting) : display_.MaxLuminance;
+        k[0] = float(white) / kScrgbNits;
+        k[1] = 1;
+        if (peak > 0 && float(white) > peak) {
+            float pw = Pq(float(white));
+            float end = Pq(peak) / pw;
+            k[2] = std::max(1.5f * end - 0.5f, 0.0f);  // BT.2390's KS
+            k[3] = pw;
+            k[4] = end;
+        }
+    }
+    Begin();  // RenderUi left ImGui's descriptor heap and root signature bound
+    Transition(sdr_.Get(), sdr_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ID3D12Resource* const src[3] = {sdr_.Get(), nullptr, nullptr};
+    const DXGI_FORMAT fmt[3] = {kBgra, kBgra, kBgra};
+    Pass(kHdrHlsl, "psmain", kHdrFormat, rh, bb_w_, bb_h_, src, fmt, k, -1);
 }
 
 void D3D12Backend::ReleaseOldTextures() {
