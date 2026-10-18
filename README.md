@@ -75,7 +75,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set (with `XBE_CAPTURE_PROBE=x,y`, fractions of the picture, the capture also lists every clear and draw that changed that pixel or reached it and logs the last change) and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`.
+- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set (each texture it dumps as `tex_<address>.bmp` is also listed in `frame.txt` as guest memory held it, with how many of its levels are all zero, so a black dump tells a texture the game left zero from one decoded wrong; with `XBE_CAPTURE_PROBE=x,y`, fractions of the picture, the capture also lists every clear and draw that changed that pixel or reached it and logs the last change) and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`.
 - **Headless Harness** - Builds and runs a game on Linux without a window, GPU, audio or controller, for testing.
 - **SDK Sync** - Keeps the `sdk/` copies in game repositories in step with this repository.
 

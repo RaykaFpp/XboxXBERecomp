@@ -706,6 +706,8 @@ private:
         uint32_t data;
         uint32_t w;
         uint32_t h;
+        std::string guest;  // GuestTextureBytes at its first bind
+        bool zero;          // every byte of it zero in guest memory then
     };
     std::vector<CapTex> cap_tex_;
     // XBE_CAPTURE_PROBE: one readback slot per probed clear or draw, in the order they were recorded
@@ -2267,6 +2269,32 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
 }
 
+// bytes of level 0 a capture lists for a texture: two DXT1 blocks, one DXT3 or DXT5 block, four 32 bit texels
+constexpr uint32_t kCapHeadBytes = 16;
+
+// A dumped texture as guest memory holds it at its first bind of the capture, over the span it is uploaded from: how many
+// of its levels are all zero and how level 0 begins. tex_<address>.bmp is what the GPU sampled, so the two tell a texture
+// the title left zero from bytes the renderer decoded wrong. zero: every level is all zero
+std::string GuestTextureBytes(const TextureDesc& d, bool& zero) {
+    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+    uint32_t zero_levels = 0;
+    for (uint32_t l = 0; l < d.levels; l++) {
+        const uint8_t* level = p + LevelOffset(d, l);
+        if (std::all_of(level, level + LevelSize(d, l), [](uint8_t b) { return b == 0; })) zero_levels++;
+    }
+    zero = zero_levels == d.levels;
+    char text[160];
+    snprintf(text, sizeof(text), "fmt %X %s %ux%u levels %u: %u guest bytes, %u of the levels all zero, level 0 begins",
+             d.format, Format(d.format).name, d.width, d.height, d.levels, TotalSize(d), zero_levels);
+    std::string s = text;
+    uint32_t head = std::min(kCapHeadBytes, LevelSize(d, 0));
+    for (uint32_t i = 0; i < head; i++) {
+        snprintf(text, sizeof(text), " %02X", p[i]);
+        s += text;
+    }
+    return s;
+}
+
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
     for (int i = 0; i < 4; i++) {
         ID3D12Resource* res = stages.res[i];
@@ -2281,7 +2309,9 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
-            cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
+            bool zero;
+            std::string guest = GuestTextureBytes(d, zero);
+            cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height, std::move(guest), zero});
         }
     }
 }
@@ -2841,12 +2871,24 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     CapStep(Surface{});
     Target* f = FindTarget(front, false);
     if (f) CapSave(*f, "final");
+    // each dumped texture as the title held it: after the draws, ahead of the probe's story that ends the file
+    fprintf(cap_, "textures as guest memory held them at their first bind, tex_<address>.bmp is what the draws sampled\n");
+    std::string zero;
+    size_t zeros = 0;
     for (auto& t : cap_tex_) {
         char name[32];
         snprintf(name, sizeof(name), "tex_%08X", t.data);
         D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         CapSave({.res = t.res.Get(), .state = &st, .fmt = t.fmt, .w = t.w, .h = t.h}, name);
+        fprintf(cap_, "tex %08X %s\n", t.data, t.guest.c_str());
+        if (t.zero) {
+            zeros++;
+            zero += ' ';
+            zero += name + 4;  // the address
+        }
     }
+    LOGI("d3d12: capture: %zu of %zu dumped textures are all zero in guest memory%s", zeros, cap_tex_.size(),
+         zero.c_str());
     FinishProbe(f);
     fclose(cap_);
     cap_ = nullptr;
