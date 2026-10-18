@@ -2787,7 +2787,14 @@ void D3D12Backend::BlitFrame(Target& t) {
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
-    float uv[4] = {0, 0, 1, 1};
+    // only the rows the title draws into: uv is origin and size, so a game that renders a shorter
+    // picture inside the console frame has its dead rows left behind instead of shown as bars
+    float v0 = 0.0f, dv = 1.0f;
+    if (app::kGame.picture_height && guest_h_) {
+        v0 = float(app::kGame.picture_top) / float(guest_h_);
+        dv = float(app::kGame.picture_height) / float(guest_h_);
+    }
+    float uv[4] = {0, v0, 1, dv};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
