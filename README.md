@@ -58,7 +58,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 ### Graphics
 - **Direct3D 8** - Implements Direct3D 8 as the XDK does it, including immediate mode draws, palettes, gamma ramps and Direct3D code built into the game.
 - **Native Direct3D 12 Renderer** - Translates the Xbox's vertex programs, pixel combiners and fixed function pipeline to HLSL, with rendering on its own thread.
-- **Shader Cache** - Compiles shaders and pipelines on worker threads (`XBE_SHADER_THREADS=N`, 0 compiles them on the render thread) and keeps them in a `shadercache` folder beside the exe between runs (`XBE_NO_SHADER_CACHE=1` turns it off); pipeline blobs are only reused on the adapter and driver that made them.
+- **Shader Cache** - Compiles shaders and pipelines on worker threads and keeps them in a `shadercache` folder beside the exe between runs; pipeline blobs are only reused on the adapter and driver that made them.
 - **Renderer Extensions** - Allows a game to change render targets, add passes and add to the generated shaders through `gpu::Extension`, set with `gpu::SetExtension` from `GameInfo::init`.
 
 ### Audio
@@ -75,7 +75,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. `XBE_STATE_VERIFY=1` compares every piece of the draw state the recorder sends and logs a change its writer did not mark, which proves the marked-only state sends are sound. `XBE_NO_DRAW_REUSE=1` makes every draw bind, write and upload all of its state again (one fast path at a time: `XBE_NO_STAGE_REUSE`, `XBE_NO_VIEW_REUSE`, `XBE_NO_PSO_REUSE`, `XBE_NO_CONST_REUSE`, `XBE_NO_BIND_GATE`), and `XBE_NO_VRAM_BUDGET=1` sweeps textures on the fixed schedule instead of keeping them while the video memory budget has room.
+- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set (with `XBE_CAPTURE_PROBE=x,y`, fractions of the picture, the capture also lists every clear and draw that changed that pixel or reached it and logs the last change) and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`.
 - **Headless Harness** - Builds and runs a game on Linux without a window, GPU, audio or controller, for testing.
 - **SDK Sync** - Keeps the `sdk/` copies in game repositories in step with this repository.
 

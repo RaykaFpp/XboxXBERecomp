@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -33,6 +35,15 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             FAILED(xa->CreateSourceVoice(&voice, &wf))) {
             LOGE("audio: XAudio2 unavailable, no sound");
             return;
+        }
+        // XBE_MUTE silences the output for automated runs on the owner's desktop. It turns the
+        // mastering voice down and nothing else: the mixer still renders every voice, so the
+        // guest's sound state and timing are exactly what they are in a normal run, and the
+        // Windows mixer is never touched. Unset, the game is audible - that is the shipping
+        // behaviour and this must never default on.
+        if (const char* m = std::getenv("XBE_MUTE"); m && m[0] && std::strcmp(m, "0") != 0) {
+            master->SetVolume(0.0f);
+            LOGI("audio: XBE_MUTE, output silenced");
         }
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;

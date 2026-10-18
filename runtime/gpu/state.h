@@ -1,5 +1,7 @@
 #pragma once
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -181,6 +183,40 @@ struct State {
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
     float zscale = 16777215.0f;  // depth buffer units per 1.0
+
+    // Not API state, and kept last: the render thread's recorder sends the plain data before it. A bit per 64 byte
+    // block of this State, set by whoever writes the block, so the recorder compares only the blocks written since its
+    // last command with what it sent (render_thread.cpp, SendState). A writer marks after writing; a State made, copied
+    // or assigned whole has every block marked. A mark is an atomic or: the setters that take no device lock may run on
+    // another guest thread than the draws, and the old full compare lost no write that way, so neither may two marks of
+    // one word. The recorder takes a word with an exchange, so a mark made while it runs stays for its next command.
+    // XBE_STATE_VERIFY=1 logs a change no mark covered.
+    static constexpr size_t kBlock = 64, kDirtyWords = 12;
+    struct Dirty {
+        std::array<std::atomic<uint64_t>, kDirtyWords> words;
+        Dirty() { All(); }
+        Dirty(const Dirty&) { All(); }
+        Dirty& operator=(const Dirty&) {
+            All();
+            return *this;
+        }
+        void All() {
+            for (auto& w : words) w.store(~0ull, std::memory_order_release);
+        }
+    };
+    mutable Dirty dirty;
+
+    // n bytes at p, inside this State, were written
+    void Mark(const void* p, size_t n) const {
+        if (!n) return;
+        size_t at = size_t(static_cast<const uint8_t*>(p) - reinterpret_cast<const uint8_t*>(this));
+        size_t first = at / kBlock, last = (at + n - 1) / kBlock;
+        for (size_t w = first / 64; w <= last / 64; w++) {
+            size_t lo = w == first / 64 ? first % 64 : 0, hi = w == last / 64 ? last % 64 : 63;
+            dirty.words[w].fetch_or((~0ull << lo) & (~0ull >> (63 - hi)), std::memory_order_release);
+        }
+    }
 };
+static_assert(sizeof(State) <= State::kDirtyWords * 64 * State::kBlock, "State::dirty has a bit per 64 byte block");
 
 }  // namespace gpu
