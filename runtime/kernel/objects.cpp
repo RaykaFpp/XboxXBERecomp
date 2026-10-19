@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <map>
 #include <queue>
@@ -92,6 +93,11 @@ ObjectRef FromPointer(uint32_t guest) {
             o = std::make_shared<Object>(ObjType::Mutant);
             o->signal = state;
             break;
+        case 4:  // QueueObject: an I/O completion queue header with no packet storage of its own
+            o = std::make_shared<Object>(ObjType::Queue);
+            o->signal = state;
+            o->limit = int32_t(R32(guest + 0x1C));
+            break;
         case 5:
             o = std::make_shared<Object>(ObjType::Semaphore);
             o->signal = state;
@@ -121,11 +127,21 @@ ObjectRef FromPointer(uint32_t guest) {
     Stamp(guest, serial);
     return o;
 }
-
 ObjectRef FindNamed(const std::string& name) {
     std::lock_guard<std::mutex> lock(g_names_lock);
     auto it = g_names.find(name);
-    return it == g_names.end() ? nullptr : it->second.lock();
+    if (it != g_names.end())
+        if (ObjectRef found = it->second.lock()) return found;
+    // the object namespace is case-insensitive (OBJ_CASE_INSENSITIVE): fall back to a folded match
+    auto fold = [](std::string s) {
+        for (char& c : s) c = char(std::toupper(uint8_t(c)));
+        return s;
+    };
+    std::string want = fold(name);
+    for (auto& [key, weak] : g_names)
+        if (fold(key) == want)
+            if (ObjectRef found = weak.lock()) return found;
+    return nullptr;
 }
 
 void AddNamed(const std::string& name, ObjectRef obj) {

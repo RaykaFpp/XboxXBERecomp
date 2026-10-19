@@ -1,3 +1,5 @@
+#if defined(_WIN32)
+
 // the host: window, message loop, crash dumps; the game is described by app::kGame
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -283,3 +285,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     logx::Flush();
     kernel::Shutdown(0);
 }
+
+#endif  // defined(_WIN32)

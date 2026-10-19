@@ -1,4 +1,5 @@
 // the settings file beside the exe
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <SDL3/SDL.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +19,9 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#if !defined(_WIN32)
+#include "app/platform.h"
+#endif
 #include "core/log.h"
 
 namespace app {
@@ -127,6 +134,7 @@ void LogSettings() {
 }
 
 Mode Desktop() {
+#if defined(_WIN32)
     HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -135,6 +143,19 @@ Mode Desktop() {
     if (GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm))
         return {dm.dmPelsWidth, dm.dmPelsHeight};
     return {uint32_t(GetSystemMetrics(SM_CXSCREEN)), uint32_t(GetSystemMetrics(SM_CYSCREEN))};
+#else
+    // The same answer through SDL3: the bounds of the display the window is on, the
+    // primary display before the window exists. platform::DesktopSize() (the same calls
+    // over the current display mode) is the fallback when SDL has no display to name yet,
+    // e.g. LogSystem asking before SDL_Init; it falls back to 1280x720 itself.
+    SDL_Window* window = platform::SdlWindow();
+    SDL_DisplayID display = window ? SDL_GetDisplayForWindow(window) : SDL_GetPrimaryDisplay();
+    SDL_Rect bounds{};
+    if (display && SDL_GetDisplayBounds(display, &bounds) && bounds.w > 0 && bounds.h > 0)
+        return {uint32_t(bounds.w), uint32_t(bounds.h)};
+    platform::Size desk = platform::DesktopSize();
+    return {desk.width, desk.height};
+#endif
 }
 
 Mode Output() {

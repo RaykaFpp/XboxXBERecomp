@@ -13,6 +13,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <unistd.h>  // ftruncate, on the memfd the 4 GiB guest space is mapped from
 #endif
 
 namespace mem {

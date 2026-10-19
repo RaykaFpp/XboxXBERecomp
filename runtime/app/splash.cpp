@@ -1,6 +1,7 @@
 // The boot splash: GameInfo::splash .bmp or .png beside the exe, centred in a borderless window. The game boots behind
 // it with its window hidden and waits at its first frame until the splash has been up kMinimum, since this boot takes
 // a fraction of a second. No file, or a relaunch: no splash.
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -10,18 +11,30 @@
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#else
+#include <SDL3/SDL.h>
+#endif
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#if defined(_WIN32)
 #include <cwchar>
+#endif
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "app/app.h"
+#if !defined(_WIN32)
+#include "app/image_decode.h"
+#endif
 #include "core/log.h"
 
+#if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
+#endif
 
 namespace app {
 
@@ -29,9 +42,12 @@ namespace {
 
 constexpr auto kMinimum = std::chrono::seconds(1);
 
-HWND g_splash = nullptr;
 std::atomic<bool> g_waiting{false};
 std::chrono::steady_clock::time_point g_until;
+
+#if defined(_WIN32)
+
+HWND g_splash = nullptr;
 
 // premultiplied BGRA, as UpdateLayeredWindow wants it; a picture without alpha comes out opaque
 bool Read(const std::filesystem::path& path, std::vector<uint32_t>& pixels, UINT& w, UINT& h) {
@@ -59,9 +75,70 @@ bool Read(const std::filesystem::path& path, std::vector<uint32_t>& pixels, UINT
     return true;
 }
 
+#else  // !defined(_WIN32)
+
+// Linux: a borderless, always-on-top SDL window with the picture as a
+// texture, the counterpart of the layered Win32 window above. SDL video is
+// started here (refcounted) because app/main_sdl.cpp calls OpenSplash
+// before its own SDL_Init; images come from SDL_LoadBMP (.bmp) and from
+// app/image_decode.cpp (.png, decoded with zlib - SDL3_image is absent).
+SDL_Window* g_splash_window = nullptr;
+SDL_Renderer* g_splash_renderer = nullptr;
+SDL_Texture* g_splash_texture = nullptr;
+
+// wchar_t is one UTF-32 code unit on Linux; game names are plain text.
+std::string Narrow(const wchar_t* wide) {
+    std::string out;
+    if (!wide) return out;
+    for (const wchar_t* p = wide; *p; p++) {
+        char32_t c = char32_t(*p);
+        if (c < 0x80) {
+            out += char(c);
+        } else if (c < 0x800) {
+            out += char(0xC0 | (c >> 6));
+            out += char(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += char(0xE0 | (c >> 12));
+            out += char(0x80 | ((c >> 6) & 0x3F));
+            out += char(0x80 | (c & 0x3F));
+        } else {
+            out += char(0xF0 | (c >> 18));
+            out += char(0x80 | ((c >> 12) & 0x3F));
+            out += char(0x80 | ((c >> 6) & 0x3F));
+            out += char(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+// The --relaunched rule, as GetCommandLineW serves it on Windows:
+// /proc/self/cmdline is the same command line, NUL-separated.
+bool Relaunched() {
+    FILE* f = std::fopen("/proc/self/cmdline", "rb");
+    if (!f) return false;
+    std::string cmd;
+    char buf[1024];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) cmd.append(buf, n);
+    std::fclose(f);
+    return cmd.find("--relaunched") != std::string::npos;
+}
+
+void DestroySplashObjects() {
+    if (g_splash_texture) SDL_DestroyTexture(g_splash_texture);
+    if (g_splash_renderer) SDL_DestroyRenderer(g_splash_renderer);
+    if (g_splash_window) SDL_DestroyWindow(g_splash_window);
+    g_splash_texture = nullptr;
+    g_splash_renderer = nullptr;
+    g_splash_window = nullptr;
+}
+
+#endif  // defined(_WIN32)
+
 }  // namespace
 
 bool OpenSplash() {
+#if defined(_WIN32)
     if (std::wcsstr(GetCommandLineW(), L"--relaunched")) return false;
     std::vector<uint32_t> pixels;
     UINT w = 0, h = 0;
@@ -113,6 +190,80 @@ bool OpenSplash() {
     g_waiting = true;
     LOGI("splash: %s, %ux%u", path.string().c_str(), w, h);
     return true;
+#else  // !defined(_WIN32)
+    if (Relaunched()) return false;
+    std::vector<uint8_t> pixels;  // straight RGBA8, from the PNG decoder
+    uint32_t w = 0, h = 0;
+    SDL_Surface* bmp = nullptr;  // set instead when the .bmp is the picture
+    std::filesystem::path path;
+    std::string base = Narrow(kGame.splash);
+    for (const char* ext : {".bmp", ".png"}) {
+        std::error_code ec;
+        path = ExeDir() / (base + ext);
+        if (!std::filesystem::exists(path, ec)) continue;
+        if (ext[1] == 'b') {
+            bmp = SDL_LoadBMP(path.string().c_str());
+            if (bmp) {
+                w = uint32_t(bmp->w);
+                h = uint32_t(bmp->h);
+                break;
+            }
+            LOGW("splash: %s could not be read (%s)", path.string().c_str(), SDL_GetError());
+        } else if (DecodePng(path, pixels, w, h)) {
+            break;
+        }
+        pixels.clear();
+    }
+    if (!bmp && pixels.empty()) return false;
+
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        LOGW("splash: SDL video failed to start: %s", SDL_GetError());
+        if (bmp) SDL_DestroySurface(bmp);
+        return false;
+    }
+    // centred on the primary screen at one image pixel per screen pixel
+    std::string title = Narrow(kGame.title);
+    g_splash_window = SDL_CreateWindow(title.c_str(), int(w), int(h),
+                                       SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_UTILITY);
+    if (!g_splash_window) {
+        LOGW("splash: window failed: %s", SDL_GetError());
+        if (bmp) SDL_DestroySurface(bmp);
+        return false;
+    }
+    SDL_SetWindowPosition(g_splash_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    g_splash_renderer = SDL_CreateRenderer(g_splash_window, nullptr);
+    if (!g_splash_renderer) {
+        LOGW("splash: renderer failed: %s", SDL_GetError());
+        DestroySplashObjects();
+        if (bmp) SDL_DestroySurface(bmp);
+        return false;
+    }
+    // The texture copies the pixels, so the surface (loaded .bmp, or the one
+    // wrapping the decoded RGBA) is released either way.
+    SDL_Surface* surface = bmp;
+    if (!surface) {
+        surface = SDL_CreateSurfaceFrom(int(w), int(h), SDL_PIXELFORMAT_RGBA32, pixels.data(), int(w) * 4);
+        if (!surface) LOGW("splash: surface failed: %s", SDL_GetError());
+    }
+    if (surface) {
+        g_splash_texture = SDL_CreateTextureFromSurface(g_splash_renderer, surface);
+        SDL_DestroySurface(surface);
+    }
+    if (!g_splash_texture) {
+        LOGW("splash: texture failed: %s", SDL_GetError());
+        DestroySplashObjects();
+        return false;
+    }
+    SDL_SetTextureBlendMode(g_splash_texture, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(g_splash_renderer, 0, 0, 0, 0);
+    SDL_RenderClear(g_splash_renderer);
+    SDL_RenderTexture(g_splash_renderer, g_splash_texture, nullptr, nullptr);
+    SDL_RenderPresent(g_splash_renderer);
+    g_until = std::chrono::steady_clock::now() + kMinimum;
+    g_waiting = true;
+    LOGI("splash: %s, %ux%u", path.string().c_str(), w, h);
+    return true;
+#endif  // defined(_WIN32)
 }
 
 void SplashFirstFrame() {
@@ -122,8 +273,12 @@ void SplashFirstFrame() {
 }
 
 void CloseSplash() {
+#if defined(_WIN32)
     if (g_splash) DestroyWindow(g_splash);
     g_splash = nullptr;
+#else
+    DestroySplashObjects();
+#endif
 }
 
 }  // namespace app

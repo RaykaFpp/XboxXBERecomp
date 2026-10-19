@@ -2,6 +2,7 @@
 // takes at call time (state changes, resource headers, indices, rects) and goes on; vertex, texture and surface memory
 // are read when the draw runs, as the console's GPU reads them after the call returns. The XDK's fences, busy checks
 // and locks wait for that.
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +10,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <pthread.h>
+#endif
 #include <smmintrin.h>
 
 #include <algorithm>
@@ -459,10 +463,14 @@ private:
     }
 
     void Run() {
+#if defined(_WIN32)
         using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
             set(GetCurrentThread(), L"render");
+#else
+        pthread_setname_np(pthread_self(), "render");  // 15 chars plus NUL is the kernel's limit
+#endif
         for (;;) {
             Batch* b;
             {
