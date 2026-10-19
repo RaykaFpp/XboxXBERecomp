@@ -188,6 +188,8 @@ std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle);  //
 bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out);  // from a host folder or the disc image
 // io completion (iocp.cpp): queues one packet on a port made by NtCreateIoCompletion; a no-op for other objects
 void PostIoCompletion(const ObjectRef& port, uint32_t key, uint32_t apc_context, uint32_t status, uint32_t information);
+// R12: the one constructor of ObjType::Queue objects, so the type tag and the packet-carrying type always agree
+ObjectRef NewIoCompletion(uint32_t max_threads);
 
 // boot
 bool Boot(std::vector<uint8_t> xbe, const std::string& xbe_name, const std::string& game_dir, const std::string& data_dir);

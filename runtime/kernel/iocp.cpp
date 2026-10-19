@@ -37,12 +37,13 @@ std::shared_ptr<IoCompletion> PortFromHandle(uint32_t handle, uint32_t& status) 
     return port;
 }
 
-// the caller holds no lock; the queue and its SignalState change together under the dispatcher lock
+// the caller holds no lock; the queue and its SignalState change together under the dispatcher lock. The
+// outstanding count lives in SignalState only: KQUEUE.CurrentCount (+0x18) counts the threads servicing the
+// queue on NT, not its packets, and is left as the guest built it (review note, KQUEUE.CurrentCount)
 void PushPacket(const std::shared_ptr<IoCompletion>& port, Packet packet) {
     std::lock_guard<std::mutex> lock(DispatchLock());
     port->packets.push_back(packet);
     SetSignal(*port, int32_t(port->packets.size()));
-    if (port->guest) W32(port->guest + 0x18, uint32_t(port->packets.size()));  // KQUEUE.CurrentCount
     SignalChanged();
 }
 
@@ -77,6 +78,12 @@ uint32_t DosError(uint32_t status) {
 
 }  // namespace
 
+ObjectRef NewIoCompletion(uint32_t max_threads) {
+    auto port = std::make_shared<IoCompletion>();
+    port->max_threads = max_threads ? max_threads : 1;
+    return port;
+}
+
 void PostIoCompletion(const ObjectRef& port, uint32_t key, uint32_t apc_context, uint32_t status,
                       uint32_t information) {
     auto queue = std::dynamic_pointer_cast<IoCompletion>(port);
@@ -94,8 +101,7 @@ KERNEL_EXPORT(191, NtCreateIoCompletion, 4) {
             W32(handle_out, NewHandle(existing));
             return kObjectNameExists;
         }
-    auto port = std::make_shared<IoCompletion>();
-    port->max_threads = count ? count : 1;
+    auto port = std::static_pointer_cast<IoCompletion>(NewIoCompletion(count));
     uint32_t body = mem::AllocSystem(0x28);
     std::memset(HostPtr(body), 0, 0x28);
     G<uint8_t>(body) = 4;       // QueueObject
@@ -136,7 +142,6 @@ KERNEL_EXPORT(223, NtRemoveIoCompletion, 5) {
                 Packet packet = port->packets.front();
                 port->packets.pop_front();
                 SetSignal(*port, int32_t(port->packets.size()));
-                if (port->guest) W32(port->guest + 0x18, uint32_t(port->packets.size()));
                 if (a[1]) W32(a[1], packet.key);
                 if (a[2]) W32(a[2], packet.apc_context);
                 if (a[3]) {

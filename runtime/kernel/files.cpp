@@ -601,6 +601,8 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
             }
             ObjectRef port = FromHandle(port_handle);
             if (!port) return kInvalidHandle;
+            // R12: NewIoCompletion is the only constructor of ObjType::Queue, so this tag test and
+            // PostIoCompletion's dynamic type test accept exactly the same objects
             if (port->type != ObjType::Queue) return kObjectTypeMismatch;
             f->completion_port = port;
             f->completion_key = R32(in + 4);

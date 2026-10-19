@@ -81,7 +81,7 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
 #ifdef _WIN32
     file_ = intptr_t(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
 #else
-    file_ = open(path.c_str(), O_RDONLY);
+    file_ = open(path.c_str(), O_RDONLY | O_CLOEXEC);  // review note: not inherited across Relaunch's execv
 #endif
     if (file_ == -1) {
         error = "cannot open the file";

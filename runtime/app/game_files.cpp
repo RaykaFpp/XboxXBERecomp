@@ -133,10 +133,26 @@ std::string Sha1(const std::vector<uint8_t>& data) {
     return hex;
 }
 
+// R13: an XBE is a few MB (this title's is under 8); a wrong or multi-GB file in its place is
+// refused by size before anything is read or hashed
+constexpr uintmax_t kMaxHostXbe = 256ull << 20;
+
 bool ReadHostFile(const fs::path& path, std::vector<uint8_t>& out) {
+    std::error_code ec;
+    uintmax_t size = fs::file_size(path, ec);
+    if (ec) return false;
+    if (size > kMaxHostXbe) {
+        LOGE("game: %s is %llu bytes, over the %llu-byte limit for an XBE; ignoring it", path.string().c_str(),
+             (unsigned long long)size, (unsigned long long)kMaxHostXbe);
+        return false;
+    }
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    out.assign(std::istreambuf_iterator<char>(f), {});
+    out.resize(size_t(size));
+    if (size && !f.read(reinterpret_cast<char*>(out.data()), std::streamsize(size))) {
+        out.clear();
+        return false;
+    }
     return true;
 }
 
@@ -180,15 +196,18 @@ uint64_t CountGameFiles(const fs::path& assets) {
             continue;
         }
         if (!e.is_regular_file(ec2)) continue;
-        // Belt and braces for artefact folders the iterator was already inside.
+        // Belt and braces for artefact folders the iterator was already inside. Folders only: the
+        // file's own name is not a folder, so a data file named "log" or "settings" still counts.
         bool in_artefact = false;
-        for (const auto& part : e.path().lexically_relative(assets))
+        for (const auto& part : e.path().lexically_relative(assets).parent_path())
             if (IsHostArtefactDir(part)) in_artefact = true;
         if (in_artefact || IsHostArtefactFile(e.path())) continue;
         if (FoldEqual(e.path().filename().string(), IMAGE_XBE)) continue;
         if (Fold(e.path().extension().string()) == ".iso") continue;
         count++;
     }
+    // the count is advisory, but a walk cut short by an I/O error undercounts; say so
+    if (ec) LOGW("game: counting files in %s stopped early (%s)", assets.string().c_str(), ec.message().c_str());
     return count;
 }
 

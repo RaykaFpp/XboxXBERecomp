@@ -62,7 +62,11 @@ void LoadPersistedDisplay() {
         head[6] > 1040)
         return;
     uint32_t block = mem::AllocContiguous(0x40 + head[4], 0, 0xFFFFFFFF, 0x1000);
-    if (!block || !f.read(static_cast<char*>(HostPtr(block + 0x40)), head[4])) return;
+    if (!block) return;
+    if (!f.read(static_cast<char*>(HostPtr(block + 0x40)), head[4])) {
+        mem::FreeContiguous(block);  // review note: a short file must not leak the block
+        return;
+    }
     g_kept_picture.resize(head[6]);
     if (!f.read(g_kept_picture.data(), head[6])) g_kept_picture.clear();
     W32(block, (head[1] & 0xFFFF0000) | 1);
@@ -78,10 +82,13 @@ void LoadPersistedDisplay() {
 
 void SavePersistedDisplay(uint32_t common, uint32_t format, uint32_t size, const void* pixels, uint32_t bytes) {
     if (FILE* f = std::fopen(PersistFile().c_str(), "wb")) {
-        uint32_t head[7] = {kPersistMagic, common, format, size, bytes, g_mark, uint32_t(g_picture.size())};
+        // review note: the loader rejects a picture over 1040 bytes along with the whole file, so an
+        // oversize path is dropped here and the pixels are still kept
+        uint32_t picture = g_picture.size() <= 1040 ? uint32_t(g_picture.size()) : 0;
+        uint32_t head[7] = {kPersistMagic, common, format, size, bytes, g_mark, picture};
         std::fwrite(head, sizeof head, 1, f);
         std::fwrite(pixels, 1, bytes, f);
-        std::fwrite(g_picture.data(), 1, g_picture.size(), f);
+        std::fwrite(g_picture.data(), 1, picture, f);
         std::fclose(f);
     }
 }
@@ -385,8 +392,8 @@ void Relaunch(const char* exe) {
                     listener = -1;
                     continue;
                 }
-                close(listener);  // the one peer is in; no second is expected
-                listener = -1;
+                // review note: the listener stays open until the byte arrives, so a peer that
+                // closes without one does not end every chance of the real handover
                 continue;  // now wait for its byte (or its death) instead
             }
             char byte;
@@ -395,8 +402,8 @@ void Relaunch(const char* exe) {
                 done = true;  // first frames presented: hand over
             } else if (r == 0) {
                 // Closed without a byte: FinishHandover only closes after
-                // writing, so this is a peer that gave up; keep waiting for
-                // the child itself or the deadline, as an unset event would.
+                // writing, so this is a peer that gave up; go back to the
+                // listener for another, as an unset event would keep waiting.
                 close(conn);
                 conn = -1;
                 continue;

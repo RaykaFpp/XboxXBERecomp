@@ -21,16 +21,18 @@
 namespace audio {
 namespace {
 
-// Mirrors xaudio2.cpp exactly: 48 kHz interleaved stereo IEEE float, rendered
-// in kRate/100-frame (10 ms, 480-frame) chunks, with at most ~3 chunks' worth
-// of audio ahead of the device. XAudio2 polls BuffersQueued < 3 before
-// submitting another 10 ms buffer; here SDL's get-callback is the pull, and
-// each callback is satisfied in the same 10 ms chunks, capped at the same
-// three-chunk lookahead so latency does not drift above the Windows path.
+// Mirrors xaudio2.cpp's format: 48 kHz interleaved stereo IEEE float, rendered
+// in kRate/100-frame (10 ms, 480-frame) chunks. XAudio2 polls BuffersQueued < 3
+// before submitting another 10 ms buffer; here SDL's get-callback is the pull,
+// and the stream's own buffer already bounds latency, so each callback is
+// satisfied in full. R14: a three-chunk cap under-filled any device period
+// above 30 ms (a 2048-frame PipeWire/Pulse quantum is 42.7 ms), leaving SDL to
+// pad a gap of silence every period; the cap now only bounds a runaway
+// request, at 200 ms, above the largest quantum (8192 frames, 170.7 ms).
 constexpr uint32_t kFrames = kRate / 100;         // 480 frames = 10 ms
 constexpr uint32_t kChannels = 2;
 constexpr int kChunkBytes = int(kFrames * kChannels * sizeof(float));  // 3840
-constexpr int kMaxChunksPerCallback = 3;
+constexpr int kMaxChunksPerCallback = 20;
 
 // Host-side proof counters, same meaning as in xaudio2.cpp: what actually
 // reached the device, and the mixed output's peak since the last log line.
@@ -47,6 +49,8 @@ struct Output {
     // removed/lost playback device looks like from here.
     std::atomic<uint64_t> last_pull_ns{0};
     bool muted = false;
+    // the watcher retries a failed open every 500 ms; log the failure once per outage, not per retry
+    bool open_failed = false;
     // one chunk's scratch: the callback renders into this, never allocates
     float buf[kFrames * kChannels];
 };
@@ -91,7 +95,8 @@ bool OpenStream(Output* o) {
     SDL_AudioStream* stream =
         SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, OnGet, o);
     if (!stream) {
-        LOGE("audio: SDL_OpenAudioDeviceStream failed: %s", SDL_GetError());
+        if (!o->open_failed) LOGE("audio: SDL_OpenAudioDeviceStream failed: %s (retrying quietly)", SDL_GetError());
+        o->open_failed = true;
         return false;
     }
     o->stream = stream;
@@ -105,12 +110,14 @@ bool OpenStream(Output* o) {
         LOGW("audio: SDL_SetAudioStreamGain(0) failed: %s", SDL_GetError());
     o->last_pull_ns.store(SDL_GetTicksNS(), std::memory_order_relaxed);
     if (!SDL_ResumeAudioStreamDevice(stream)) {
-        LOGE("audio: SDL_ResumeAudioStreamDevice failed: %s", SDL_GetError());
+        if (!o->open_failed) LOGE("audio: SDL_ResumeAudioStreamDevice failed: %s (retrying quietly)", SDL_GetError());
+        o->open_failed = true;
         SDL_DestroyAudioStream(stream);
         o->stream = nullptr;
         o->device = 0;
         return false;
     }
+    o->open_failed = false;
     const char* name = o->device ? SDL_GetAudioDeviceName(o->device) : nullptr;
     LOGI("audio: sdl stream ok, device '%s' %u Hz %u ch F32", name ? name : "default", kRate, kChannels);
     if (o->muted) LOGI("audio: XBE_MUTE, output silenced");
@@ -164,7 +171,7 @@ void CloseStream(Output* o) {
         // driver, stops pulling: no get-callback for a second while the
         // stream is supposed to be playing means the stream is dead.
         bool reopen = false;
-        if (o->stream && !reopen) {
+        if (o->stream) {
             uint64_t last = o->last_pull_ns.load(std::memory_order_relaxed);
             if (last && SDL_GetTicksNS() - last > 1'000'000'000ull) {
                 LOGW("audio: no pull from SDL for 1s, reopening stream");
