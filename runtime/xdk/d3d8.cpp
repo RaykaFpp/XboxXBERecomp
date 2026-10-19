@@ -249,13 +249,12 @@ void SetMultiSampleType(uint32_t type) {
     g_super_y = super ? std::max(1u, type & 0xF) : 1;
 }
 
-// The render target's SuperSampleScale as the library keeps it: the presentation's on a back buffer, 1 on any other
-// surface. Into the device, where the library's own viewport, scissor and clear code reads it, and into g_state for
-// the renderer. The title's surfaces stay the frame's size: only screen space positions are in the larger pixels.
+// The render target's SuperSampleScale as the library's render target setup (5558: 0x24AAC0) keeps it: the
+// presentation's when the target is the device's back buffer, 1 on any other surface. Into the device, where the
+// library's own viewport, scissor and clear code reads it, and into g_state for the renderer. The title's surfaces
+// stay the frame's size: only screen space positions are in the larger pixels.
 void UpdateSuperSample() {
-    uint32_t rt = Dev(kDevRenderTarget);
-    bool back = false;
-    for (uint32_t i = 1; i < g_buffer_count; i++) back |= rt == g_buffers[i];
+    bool back = Dev(kDevRenderTarget) == Dev(kDevBackBuffer);
     float x = back ? float(g_super_x) : 1.0f, y = back ? float(g_super_y) : 1.0f;
     std::memcpy(HostPtr(kDevice + kDevSuperX), &x, 4);
     std::memcpy(HostPtr(kDevice + kDevSuperY), &y, 4);
