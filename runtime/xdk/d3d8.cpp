@@ -235,10 +235,12 @@ float FrameCentreShift() {
     return w == g_frame_w && h == g_frame_h ? dx * g_state.super_x : 0;
 }
 
-// D3DMULTISAMPLE_TYPE: x samples in bits 4 to 7, y in bits 0 to 3, 0x2000 a supersampling type. A supersampled back
-// buffer is that many times the frame on each axis and is filtered down to it at present (this title asks for
-// 0x2222, D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_GAUSSIAN, and doubles its own vertex program positions to match);
-// NONE (0x11) and the multisample types keep the frame's pixels.
+// D3DMULTISAMPLE_TYPE: x samples in bits 4 to 7, y in bits 0 to 3, 0x1000 a multisampling type, 0x2000 a supersampling
+// one. The library's mode setup (5558: 0x24FB40) makes the back buffer x by y times the frame and keeps that as its
+// BackBufferScale, and its render target setup (0x24AAC0) takes SuperSampleScale from it, halved by the
+// D3DRS_MULTISAMPLEMODE a multisampling type starts with: so a supersampled back buffer has x by y render target pixels
+// to each of the frame's (this title asks for 0x2222, D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_GAUSSIAN, and doubles its own
+// vertex program positions to match), while NONE (0x11) and the multisampling types keep the frame's.
 uint32_t g_super_x = 1, g_super_y = 1;  // the presentation's, on its back buffers
 
 void SetMultiSampleType(uint32_t type) {
@@ -301,16 +303,17 @@ void StoreVsConstants(uint32_t reg, uint32_t n, uint32_t data) {
 
 bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are the title's
 
-// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them: in render target
-// pixels, SuperSampleScale of them to each of the viewport's
+// c-38 and c-37 hold the viewport scale and offset, as the library's GetViewportOffsetAndScale (5558: 0x249980)
+// computes them: the viewport in render target pixels, SuperSampleScale of them to each of its own, with the screen
+// space offset added after the scale. Summed in the library's order, which with a scale of 1 is the frame's own.
 void UpdateViewportConstants() {
     auto& v = g_state.viewport;
     Set(g_state.zscale, ZScale(g_state.zs));
     float hw = v.w * 0.5f, hh = v.h * 0.5f, sx = g_state.super_x, sy = g_state.super_y;
     if (!g_own_constants) {
         Set(g_state.vsc[58], {hw * sx, -hh * sy, (v.max_z - v.min_z) * g_state.zscale, 0});
-        Set(g_state.vsc[59], {(v.x + g_state.ss_offset_x + hw) * sx + FrameCentreShift(), (v.y + g_state.ss_offset_y + hh) * sy,
-                              v.min_z * g_state.zscale, 0});
+        Set(g_state.vsc[59], {v.x * sx + g_state.ss_offset_x + hw * sx + FrameCentreShift(),
+                              v.y * sy + g_state.ss_offset_y + hh * sy, v.min_z * g_state.zscale, 0});
     }
     // the viewport as the library's SetViewport stores it, for inlined readers
     if (XDK_CDevice_Viewport != xdk::kUnknown) {
