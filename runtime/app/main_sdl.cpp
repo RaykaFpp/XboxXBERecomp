@@ -24,6 +24,7 @@
 
 #include "app/app.h"
 #include "app/platform.h"
+#include "common/input_kbm.h"  // kbm::NoteMouse (D11 mouse cache)
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"  // gpu::g_capture (F3)
@@ -75,6 +76,16 @@ bool Relaunched() {
     for (int i = 1; i < g_argc; i++)
         if (g_argv[i] && std::strstr(g_argv[i], "--relaunched")) return true;
     return false;
+}
+
+// D11: window thread only. SDL_GetMouseState is main-thread-only, so it is sampled
+// here, in the event loop, and published through kbm::NoteMouse's atomics; guest
+// polling threads read that cache and never call SDL_GetMouseState themselves.
+void CacheMouseState() {
+    float x = 0.0f, y = 0.0f;
+    SDL_MouseButtonFlags buttons = SDL_GetMouseState(&x, &y);
+    kbm::NoteMouse(x, y, (buttons & SDL_BUTTON_MASK(SDL_BUTTON_RIGHT)) != 0,
+                   (buttons & SDL_BUTTON_MASK(SDL_BUTTON_MIDDLE)) != 0);
 }
 
 void CacheClientSize() {
@@ -257,9 +268,20 @@ std::filesystem::path ExeDir() {
 
 int Instance() {
     static const int n = [] {
+        auto clamp = [](int v) { return std::max(0, std::min(8, v)); };
         for (int i = 1; i < g_argc; i++) {
             if (!g_argv[i]) continue;
-            if (const char* p = std::strstr(g_argv[i], "--instance")) return std::max(0, std::min(8, std::atoi(p + 10)));
+            // D10: the documented forms are "--instance 2" (two argv entries) and
+            // "--instance=2"; the old strstr(p + 10) read the empty string / "=2"
+            // for both and silently yielded instance 0. The glued "--instance2"
+            // that used to be the only working form is still accepted.
+            if (std::strcmp(g_argv[i], "--instance") == 0) {
+                if (i + 1 < g_argc && g_argv[i + 1]) return clamp(std::atoi(g_argv[i + 1]));
+                return 0;
+            }
+            if (std::strncmp(g_argv[i], "--instance=", 11) == 0) return clamp(std::atoi(g_argv[i] + 11));
+            if (std::strncmp(g_argv[i], "--instance", 10) == 0 && g_argv[i][10] >= '0' && g_argv[i][10] <= '9')
+                return clamp(std::atoi(g_argv[i] + 10));
         }
         return 0;
     }();
@@ -458,6 +480,7 @@ int main(int argc, char** argv) {
             while (!quit && SDL_PollEvent(&e))
                 if (app::HandleEvent(e)) quit = true;
         }
+        app::CacheMouseState();  // D11: sample SDL mouse state here, on the window thread
         app::TryInitImGuiVulkan();
     }
     // Vulkan teardown handshake (the one main_sdl change in the present fix): the

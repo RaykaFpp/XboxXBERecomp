@@ -309,6 +309,11 @@ private:
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool fencePending = false;
         VkBuffer upload = VK_NULL_HANDLE; VkDeviceMemory uploadMem = VK_NULL_HANDLE; uint8_t* map = nullptr;
+        // D6: uploadCoherent=false when the ring fell back to HOST_VISIBLE only; its mapped
+        // range (and any non-coherent overflow allocation in uploadFlushMems) is flushed in
+        // Submit before the queue sees it.
+        bool uploadCoherent = true;
+        std::vector<VkDeviceMemory> uploadFlushMems;
         uint64_t used = 0; VkDescriptorPool pool = VK_NULL_HANDLE; uint32_t sets = 0; uint64_t gen = 0;
         VkSemaphore imageAvailable = VK_NULL_HANDLE, renderFinished = VK_NULL_HANDLE;
         std::vector<std::function<void()>> garbage;
@@ -316,7 +321,15 @@ private:
     struct Alloc { VkBuffer buffer = VK_NULL_HANDLE; uint64_t off = 0; uint8_t* cpu = nullptr; };
     struct Late {
         ImageRes down; VkBuffer rb[kFrames] = {}; VkDeviceMemory rbm[kFrames] = {};
+        // D2/D3: fence[i] is the submission number RecordLate predicts for the copy in rb[i],
+        // submitFence[i] the VkFence that submission signals (Cur().fence, resolved on the
+        // render thread while recording), rbCoherent[i] whether rbm[i] needs an invalidate
+        // before a CPU read. A slot is finished only when its number has actually been
+        // submitted (submitCounter_ reached it) and that fence signalled; a recorded but
+        // unsubmitted copy is not finished.
         uint64_t fence[kFrames] = {}, frame[kFrames] = {}, delivered = 0;
+        VkFence submitFence[kFrames] = {};
+        bool rbCoherent[kFrames] = {true, true, true};
         uint32_t gw = 0, gh = 0, next = 0;
     };
     bool CreateDeviceAndSwap();
@@ -324,6 +337,13 @@ private:
     void DestroySwapchain();
     void ResizeSwapIfNeeded(bool force = false);
     uint32_t FindMemory(uint32_t typeBits, VkMemoryPropertyFlags props) const;
+    // D6: host-visible memory for uploads/read-backs: coherent if there is any, else
+    // HOST_VISIBLE only (coherent=false; caller flushes/invalidates explicitly).
+    // UINT32_MAX when neither exists.
+    uint32_t FindHostMemory(uint32_t typeBits, bool& coherent) const;
+    // D7: a segment that never reached the queue leaves its RecordLate copies
+    // recorded-but-never-submitted; drop their stamps so they are never delivered.
+    void DiscardRecordedLate();
     ImageRes CreateImage(uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                          uint32_t layers = 1, VkImageType type = VK_IMAGE_TYPE_2D, uint32_t mips = 1);
     VkImageView MakeView(VkImage image, VkFormat fmt, VkImageViewType type, VkImageAspectFlags aspect, uint32_t levels, uint32_t layers);
@@ -421,8 +441,13 @@ private:
     Frame frames_[kFrames];
     uint64_t frame_ = 0, presents_ = 0;
     bool recording_ = false; uint64_t segmentGen_ = 0;  // bumped every time EnsureRecording opens a segment
-    uint64_t submitCounter_ = 0;
-    std::unordered_map<uint64_t, VkFence> submitFences_;
+    // D2: submissions successfully queued, published by Submit (render thread) after
+    // vkQueueSubmit and read by DeliverLate (title thread). This atomic counter, plus
+    // the VkFence each Late slot resolved at record time, replaces the old submitFences_
+    // unordered_map that DeliverLate find()ed while Submit inserted/erased it: there is
+    // no shared mutable container left to race, and Submit pays one atomic store per
+    // segment, nothing per draw.
+    std::atomic<uint64_t> submitCounter_{0};
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
@@ -431,6 +456,10 @@ private:
     VkFormat depthFormat_ = VK_FORMAT_D24_UNORM_S8_UINT;
     bool anisotropy_ = false, fillNonSolid_ = false, bc_ = false;
     std::unordered_map<uint64_t, VkShaderModule> modules_;
+    // D4: hashes whose HLSL failed to compile this run (kept out of modules_, which
+    // never holds a null module); a vkCreateShaderModule failure is not put here, so
+    // the next bind retries it instead of caching the failure.
+    std::unordered_set<uint64_t> failedModules_;
     std::unordered_map<uint64_t, uint64_t> shaderSrc_;
     std::unordered_map<uint64_t, VkPipeline> pipelines_, blitPipelines_;
     std::unordered_map<uint64_t, VkRenderPass> passes_;
@@ -439,7 +468,10 @@ private:
     std::unordered_map<uint32_t, uint64_t> targetUsed_;
     std::unordered_map<uint64_t, Tex> textures_;
     std::unordered_map<uint32_t, Late> late_;
-    std::mutex lateLock_;
+    // Recursive because Submit (which can run nested inside RecordLate's
+    // PrepareCopySource flush) may need it on its D7 failure path while RecordLate
+    // already holds it.
+    std::recursive_mutex lateLock_;
     std::atomic<uint64_t> presentsSeen_{0};
     Target* boundRt_ = nullptr;
     Target* boundDs_ = nullptr;
@@ -531,7 +563,18 @@ namespace {
 uint32_t VulkanBackend::FindMemory(uint32_t typeBits, VkMemoryPropertyFlags props) const {
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(physical_, &mp);
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++) if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
-    return 0;
+    // D6: no match is UINT32_MAX, never type 0: type 0 may not be in typeBits at all, and
+    // every caller now bails on the sentinel instead of binding/mapping through it.
+    return UINT32_MAX;
+}
+uint32_t VulkanBackend::FindHostMemory(uint32_t typeBits, bool& coherent) const {
+    coherent = true;
+    uint32_t t = FindMemory(typeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (t != UINT32_MAX) return t;
+    // D6: fall back to HOST_VISIBLE alone, not to an arbitrary type; the caller then
+    // flushes before GPU reads and invalidates before CPU reads.
+    coherent = false;
+    return FindMemory(typeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 }
 VkImageView VulkanBackend::MakeView(VkImage image, VkFormat fmt, VkImageViewType type, VkImageAspectFlags aspect, uint32_t levels, uint32_t layers) {
     VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -551,11 +594,19 @@ ImageRes VulkanBackend::CreateImage(uint32_t w, uint32_t h, VkFormat fmt, VkImag
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(device_, r.image, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size; ai.memoryTypeIndex = FindMemory(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(device_, &ai, nullptr, &r.mem) != VK_SUCCESS) { vkDestroyImage(device_, r.image, nullptr); r.image = VK_NULL_HANDLE; return r; }
-    vkBindImageMemory(device_, r.image, r.mem, 0);
+    // D6: bail cleanly (destroying the partial image) when no type fits, allocation
+    // fails, or the bind fails, instead of handing out an image bound to nothing.
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &r.mem) != VK_SUCCESS) {
+        vkDestroyImage(device_, r.image, nullptr); r.image = VK_NULL_HANDLE; return r;
+    }
+    if (vkBindImageMemory(device_, r.image, r.mem, 0) != VK_SUCCESS) { DestroyImage(r); return r; }
     VkImageViewType vt = type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D : layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     r.view = MakeView(r.image, fmt, vt, aspect, mips, type == VK_IMAGE_TYPE_3D ? 1 : layers);
-    if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) r.srvView = MakeView(r.image, fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1);
+    if (!r.view) { DestroyImage(r); return r; }
+    if (aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+        r.srvView = MakeView(r.image, fmt, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1);
+        if (!r.srvView) { DestroyImage(r); return r; }
+    }
     return r;
 }
 void VulkanBackend::DestroyImage(ImageRes& r) {
@@ -627,7 +678,7 @@ void VulkanBackend::EnsureRecording() {
     if (recording_) return;
     Frame& f = Cur();
     if (f.fencePending) WaitFrame(f);
-    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0; f.sets = 0; f.gen = ++segmentGen_;
+    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0; f.sets = 0; f.gen = ++segmentGen_; f.uploadFlushMems.clear();
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(f.cmd, &bi); recording_ = true;
 }
@@ -652,19 +703,65 @@ void VulkanBackend::WaitFrame(Frame& f) {
     if (f.fencePending) { vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX); f.fencePending = false; }
     RunGarbage(f);
 }
+void VulkanBackend::DiscardRecordedLate() {
+    // D7/D3: called only when a segment never reached the queue. Every Late slot
+    // stamped ahead of submitCounter_ was recorded into that segment and will never
+    // run, so clear its stamp: DeliverLate must not deliver its buffer, and
+    // RecordLate may reuse the slot (the GPU never wrote it).
+    std::lock_guard lock(lateLock_);
+    uint64_t submitted = submitCounter_.load(std::memory_order_acquire);
+    for (auto& [data, l] : late_) {
+        (void)data;
+        for (int i = 0; i < kFrames; i++)
+            if (l.fence[i] > submitted) { l.fence[i] = 0; l.submitFence[i] = VK_NULL_HANDLE; }
+    }
+}
 void VulkanBackend::Submit(bool wait, VkSemaphore waitSem, VkSemaphore signalSem) {
     if (!recording_) { if (wait && device_) vkQueueWaitIdle(queue_); return; }
-    Frame& f = Cur(); vkEndCommandBuffer(f.cmd); recording_ = false; vkResetFences(device_, 1, &f.fence);
+    Frame& f = Cur();
+    // D7: every result is checked. On any failure the fence is left not pending and
+    // submitCounter_ does not advance, so the next WaitFrame cannot block forever
+    // on a fence that was reset but never submitted; the failure is logged loudly
+    // here, once, at its cause (the backend interface returns void).
+    VkResult endR = vkEndCommandBuffer(f.cmd); recording_ = false;
+    if (endR != VK_SUCCESS) {
+        LOGE("vulkan: vkEndCommandBuffer failed %d; segment dropped, fence not marked pending", int(endR));
+        DiscardRecordedLate();
+        return;
+    }
+    VkResult resetR = vkResetFences(device_, 1, &f.fence);
+    if (resetR != VK_SUCCESS) {
+        LOGE("vulkan: vkResetFences failed %d; segment not submitted, fence not marked pending", int(resetR));
+        DiscardRecordedLate();
+        return;
+    }
+    // D6: non-coherent upload memory must be flushed before the queue reads it.
+    if (!f.uploadCoherent && f.uploadMem) {
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = f.uploadMem; range.offset = 0; range.size = VK_WHOLE_SIZE;
+        vkFlushMappedMemoryRanges(device_, 1, &range);
+    }
+    for (VkDeviceMemory mem : f.uploadFlushMems) {
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = mem; range.offset = 0; range.size = VK_WHOLE_SIZE;
+        vkFlushMappedMemoryRanges(device_, 1, &range);
+    }
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &f.cmd;
     if (waitSem) { si.waitSemaphoreCount = 1; si.pWaitSemaphores = &waitSem; si.pWaitDstStageMask = &stage; }
     if (signalSem) { si.signalSemaphoreCount = 1; si.pSignalSemaphores = &signalSem; }
-    vkQueueSubmit(queue_, 1, &si, f.fence); f.fencePending = true;
-    submitCounter_++; submitFences_[submitCounter_] = f.fence;
+    VkResult submitR = vkQueueSubmit(queue_, 1, &si, f.fence);
+    if (submitR != VK_SUCCESS) {
+        LOGE("vulkan: vkQueueSubmit failed %d; fence left unsignalled and not marked pending, submission not counted", int(submitR));
+        DiscardRecordedLate();
+        return;
+    }
+    f.fencePending = true;
+    // D2: publish the submission only after vkQueueSubmit succeeded; DeliverLate
+    // (title thread) reads this atomic and the per-slot VkFence, never a shared map.
+    submitCounter_.fetch_add(1, std::memory_order_release);
     if (wait) { WaitFrame(f); f.used = 0; }
-    for (auto it = submitFences_.begin(); it != submitFences_.end();)
-        if (it->first + 16 < submitCounter_ && vkGetFenceStatus(device_, it->second) == VK_SUCCESS) it = submitFences_.erase(it); else ++it;
 }
 void VulkanBackend::Flush() { Submit(true); }
 VulkanBackend::Alloc VulkanBackend::UploadAlloc(uint64_t size, uint64_t align) {
@@ -682,10 +779,15 @@ VulkanBackend::Alloc VulkanBackend::UploadAlloc(uint64_t size, uint64_t align) {
     if (vkCreateBuffer(device_, &ci, nullptr, &buf) != VK_SUCCESS) return {};
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, buf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = mr.size; ai.memoryTypeIndex = FindMemory(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); return {}; }
-    vkBindBufferMemory(device_, buf, mem, 0);
-    void* p = nullptr; vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p);
+    // D6: no suitable host memory, a failed allocate/bind, or a failed map hands out
+    // nothing (callers already drop the draw on a null cpu) instead of arithmetic on null.
+    bool coherent = true;
+    ai.allocationSize = mr.size; ai.memoryTypeIndex = FindHostMemory(mr.memoryTypeBits, coherent);
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); return {}; }
+    if (vkBindBufferMemory(device_, buf, mem, 0) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return {}; }
+    void* p = nullptr;
+    if (vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) { vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return {}; }
+    if (!coherent) f.uploadFlushMems.push_back(mem);  // D6: flushed in Submit
     f.garbage.push_back([this, buf, mem] { vkUnmapMemory(device_, mem); vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); });
     g_vkPerf.upload += size;
     return {buf, 0, static_cast<uint8_t*>(p)};
@@ -731,13 +833,30 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bi.size = kUploadSize;
             bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-            vkCreateBuffer(device_, &bi, nullptr, &f.upload);
+            // D6: a ring that cannot be created, allocated, bound or mapped fails Init
+            // outright; otherwise UploadAlloc would hand out f.map + o on a null map and
+            // the first draw's memcpy would fault. Partial handles are destroyed and
+            // nulled so Destroy does not touch them again.
+            if (vkCreateBuffer(device_, &bi, nullptr, &f.upload) != VK_SUCCESS) {
+                LOGE("vulkan: upload ring buffer creation failed; Init fails (D6)");
+                return false;
+            }
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, f.upload, &mr);
             VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            mai.allocationSize = mr.size; mai.memoryTypeIndex = FindMemory(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            vkAllocateMemory(device_, &mai, nullptr, &f.uploadMem);
-            vkBindBufferMemory(device_, f.upload, f.uploadMem, 0);
-            vkMapMemory(device_, f.uploadMem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&f.map));
+            mai.allocationSize = mr.size; mai.memoryTypeIndex = FindHostMemory(mr.memoryTypeBits, f.uploadCoherent);
+            if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &mai, nullptr, &f.uploadMem) != VK_SUCCESS) {
+                LOGE("vulkan: upload ring allocation failed (no host-visible memory type or out of memory); Init fails (D6)");
+                vkDestroyBuffer(device_, f.upload, nullptr); f.upload = VK_NULL_HANDLE;
+                return false;
+            }
+            if (vkBindBufferMemory(device_, f.upload, f.uploadMem, 0) != VK_SUCCESS ||
+                vkMapMemory(device_, f.uploadMem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&f.map)) != VK_SUCCESS || !f.map) {
+                LOGE("vulkan: upload ring bind/map failed; Init fails (D6)");
+                f.map = nullptr;
+                vkDestroyBuffer(device_, f.upload, nullptr); f.upload = VK_NULL_HANDLE;
+                vkFreeMemory(device_, f.uploadMem, nullptr); f.uploadMem = VK_NULL_HANDLE;
+                return false;
+            }
         }
     }
     nullImage_ = CreateImage(1, 1, kBgra, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1000,18 +1119,38 @@ VkShaderModule VulkanBackend::CompileModule(const std::string& src, const char* 
     uint64_t seed = Hash(entry, std::strlen(entry), fragment ? 0x7073ull : 0x7673ull);
     hash = Hash(src.data(), src.size(), seed);
     auto it = modules_.find(hash); if (it != modules_.end()) return it->second;
+    if (failedModules_.count(hash)) return VK_NULL_HANDLE;  // D4: known HLSL compile failure this run
     std::vector<uint32_t> words; std::string error; VkShaderModule mod = VK_NULL_HANDLE;
     if (CompileHlslToSpirv(src, entry, fragment, words, &error) && !words.empty()) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = words.size() * 4; ci.pCode = words.data();
-        vkCreateShaderModule(device_, &ci, nullptr, &mod);
-    } else { LOGE("vulkan: %s shader compile failed: %s", fragment ? "ps" : "vs", error.c_str()); LOGE("%s", src.c_str()); }
+        // D4: a failed create (e.g. SPIR-V from a truncated cache file that passed the
+        // old magic-only check) is logged with the shader hash, the on-disk cache entry
+        // is discarded so the next run recompiles it, and the null module is never
+        // cached: the next bind retries instead of skipping every draw forever.
+        VkResult r = vkCreateShaderModule(device_, &ci, nullptr, &mod);
+        if (r != VK_SUCCESS) {
+            LOGE("vulkan: vkCreateShaderModule failed %d for %s shader %016llx; discarding its shader-cache entry (D4)", int(r), fragment ? "ps" : "vs", (unsigned long long)hash);
+            DiscardCachedSpirv(src, entry, fragment);
+            return VK_NULL_HANDLE;
+        }
+    } else {
+        LOGE("vulkan: %s shader compile failed: %s", fragment ? "ps" : "vs", error.c_str()); LOGE("%s", src.c_str());
+        failedModules_.insert(hash);
+        return VK_NULL_HANDLE;
+    }
     if (mod) g_vkPerf.shaders++;
     modules_[hash] = mod; return mod;
 }
 void VulkanBackend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
     auto it = shaderSrc_.find(sh.vkey);
-    if (it != shaderSrc_.end()) { sh.vs = modules_[it->second]; sh.vh = it->second; return; }
+    if (it != shaderSrc_.end()) {
+        // D4: modules_ never holds null; a missing entry means a device-side create
+        // failure, which falls through and retries instead of reading a cached null.
+        auto mit = modules_.find(it->second);
+        if (mit != modules_.end()) { sh.vs = mit->second; sh.vh = it->second; return; }
+        if (failedModules_.count(it->second)) { sh.vs = VK_NULL_HANDLE; sh.vh = it->second; return; }
+    }
     std::string src = sh.prog ? VertexProgramHlsl(s.vs->program, a.regs, a.decode) : FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
     if (sh.quad) src = QuadHlsl(std::move(src));
     sh.vs = CompileModule(src, "main", false, sh.vh); shaderSrc_[sh.vkey] = sh.vh;
@@ -1019,7 +1158,11 @@ void VulkanBackend::EnsureVertexShader(const State& s, const Assembled& a, DrawS
 void VulkanBackend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     constexpr uint64_t kSalt = 0x9E3779B97F4A7C15ull;
     auto it = shaderSrc_.find(sh.pkey ^ kSalt);
-    if (it != shaderSrc_.end()) { sh.ps = modules_[it->second]; sh.ph = it->second; return; }
+    if (it != shaderSrc_.end()) {
+        auto mit = modules_.find(it->second);
+        if (mit != modules_.end()) { sh.ps = mit->second; sh.ph = it->second; return; }
+        if (failedModules_.count(it->second)) { sh.ps = VK_NULL_HANDLE; sh.ph = it->second; return; }
+    }
     sh.ps = CompileModule(PixelHlsl(pk), "main", true, sh.ph); shaderSrc_[sh.pkey ^ kSalt] = sh.ph;
 }
 VkSampler VulkanBackend::GetSampler(const VkSamplerCreateInfo& ci) {
@@ -1807,16 +1950,25 @@ bool VulkanBackend::ReadBackImage(ImageRes& src, uint32_t w, uint32_t h, std::ve
     Transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size = uint64_t(w) * h * 4; ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    vkCreateBuffer(device_, &ci, nullptr, &buf);
+    // D6: every step is checked; a failure returns false with nothing mapped, instead
+    // of memcpy'ing from a null map of memory bound through a guessed type 0.
+    if (vkCreateBuffer(device_, &ci, nullptr, &buf) != VK_SUCCESS) return false;
     VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, buf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = FindMemory(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); return false; }
-    vkBindBufferMemory(device_, buf, mem, 0);
+    bool coherent = true;
+    ai.memoryTypeIndex = FindHostMemory(mr.memoryTypeBits, coherent);
+    if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); return false; }
+    if (vkBindBufferMemory(device_, buf, mem, 0) != VK_SUCCESS) { vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return false; }
     VkBufferImageCopy region{}; region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.imageSubresource.layerCount = 1; region.imageExtent = {w, h, 1};
     vkCmdCopyImageToBuffer(Cmd(), src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
     Flush();
-    void* p = nullptr; vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p);
+    void* p = nullptr;
+    if (vkMapMemory(device_, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) { vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return false; }
+    if (!coherent) {  // D6: HOST_VISIBLE-only memory needs an invalidate before the CPU read
+        VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        range.memory = mem; range.offset = 0; range.size = VK_WHOLE_SIZE;
+        if (vkInvalidateMappedMemoryRanges(device_, 1, &range) != VK_SUCCESS) { vkUnmapMemory(device_, mem); vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return false; }
+    }
     out.resize(size_t(w) * h * 4); std::memcpy(out.data(), p, out.size());
     vkUnmapMemory(device_, mem); vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return true;
 }
@@ -2033,8 +2185,30 @@ void VulkanBackend::Present(const Surface& front) {
         VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, Cur().imageAvailable, VK_NULL_HANDLE, &imageIndex);
         if (r == VK_ERROR_OUT_OF_DATE_KHR) { ResizeSwapIfNeeded(true); if (swapchain_) r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, Cur().imageAvailable, VK_NULL_HANDLE, &imageIndex); }
         if (r == VK_SUBOPTIMAL_KHR) swapStale_ = true;  // still usable this frame; recreate at the boundary below
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOGW("vulkan: vkAcquireNextImageKHR failed %d", int(r)); presents_++; presentsSeen_.store(presents_); frame_++; if (diag::Perf()) LogPerf(); return; }
-        if (imageIndex >= swapFbs_.size()) { LOGE("vulkan: acquire returned image %u of %zu", imageIndex, swapFbs_.size()); presents_++; presentsSeen_.store(presents_); frame_++; return; }
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            LOGW("vulkan: vkAcquireNextImageKHR failed %d", int(r));
+            // D1: the frame's draws/uploads are already recorded into this slot's open
+            // segment. Submit it (waited) while frame_ still names that slot, so the
+            // segment is closed, its garbage retires, and its fence state stays
+            // coherent, instead of advancing frame_ and leaving the next frame to
+            // record into a never-begun command buffer and reset a pending fence.
+            // This is also the routine VK_ERROR_OUT_OF_DATE_KHR-after-resize path;
+            // the acquire failed, so its semaphore was not signalled and this submit
+            // must not wait on it.
+            if (recording_) Submit(true);
+            presents_++; presentsSeen_.store(presents_); frame_++; if (diag::Perf()) LogPerf(); return;
+        }
+        if (imageIndex >= swapFbs_.size()) {
+            LOGE("vulkan: acquire returned image %u of %zu", imageIndex, swapFbs_.size());
+            // D1: same desync as above, except this acquire did signal
+            // Cur().imageAvailable: the closing submit must wait on (consume) it, or
+            // the next acquire of this slot re-signals a binary semaphore whose
+            // signal is still pending. EnsureRecording opens an (empty) segment
+            // when none is open so there is a submission to consume it with.
+            if (!recording_) EnsureRecording();
+            Submit(true, Cur().imageAvailable);
+            presents_++; presentsSeen_.store(presents_); frame_++; return;
+        }
         waitSem = Cur().imageAvailable;
     }
     if (t) PrepareBlitSource(t->res, gamma_);
@@ -2140,17 +2314,30 @@ bool VulkanBackend::DeliverLate(uint32_t data, uint32_t size) {
     Late& l = it->second;
     if (!ReadBackFits(data, l.gw, l.gh, size)) return false;
     uint64_t now = presentsSeen_.load(); int best = -1;
+    // D2: this runs on the title thread while Submit runs on the render thread. It
+    // touches no shared container: l is under lateLock_, and "finished" is the atomic
+    // submitCounter_ (published by Submit after vkQueueSubmit) plus the VkFence this
+    // slot resolved at record time. The old submitFences_ unordered_map, find()ed
+    // here while Submit inserted/erased it, is gone.
+    uint64_t submitted = submitCounter_.load(std::memory_order_acquire);
     for (int i = 0; i < kFrames; i++) {
-        if (!l.fence[i]) continue;
-        auto fit = submitFences_.find(l.fence[i]);
-        bool finished = fit == submitFences_.end() || vkGetFenceStatus(device_, fit->second) == VK_SUCCESS;
+        if (!l.fence[i] || !l.submitFence[i]) continue;
+        // D3: a stamp ahead of the submitted counter was recorded into a segment
+        // that has not been submitted yet: it is not finished, however the buffer
+        // looks, and it must not be marked delivered below.
+        bool finished = l.fence[i] <= submitted && vkGetFenceStatus(device_, l.submitFence[i]) == VK_SUCCESS;
         bool recent = now - l.frame[i] <= uint64_t(kFrames) + 1;
         bool newest = best < 0 || l.fence[i] > l.fence[best];
         if (finished && recent && newest) best = i;
     }
     if (best < 0) return false;
     if (l.fence[best] > l.delivered && l.rb[best]) {
-        void* p = nullptr; if (vkMapMemory(device_, l.rbm[best], 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
+        void* p = nullptr; if (vkMapMemory(device_, l.rbm[best], 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return false;
+        if (!l.rbCoherent[best]) {  // D6: invalidate HOST_VISIBLE-only memory before reading it
+            VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+            range.memory = l.rbm[best]; range.offset = 0; range.size = VK_WHOLE_SIZE;
+            if (vkInvalidateMappedMemoryRanges(device_, 1, &range) != VK_SUCCESS) { vkUnmapMemory(device_, l.rbm[best]); return false; }
+        }
         uint32_t pitch = GuestPitch(l.gw); uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data)); const uint8_t* sp = static_cast<const uint8_t*>(p);
         for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, sp + size_t(y) * l.gw * 4, l.gw * 4);
         vkUnmapMemory(device_, l.rbm[best]); l.delivered = l.fence[best];
@@ -2169,21 +2356,32 @@ void VulkanBackend::RecordLate(uint32_t data) {
         l = Late{}; l.gw = t.gw; l.gh = t.gh;
     }
     uint32_t slot = l.next;
-    if (l.fence[slot]) { auto fit = submitFences_.find(l.fence[slot]); if (fit != submitFences_.end() && vkGetFenceStatus(device_, fit->second) != VK_SUCCESS) return; }
+    if (l.fence[slot]) {
+        // D3: reuse only a slot whose copy is known finished: a stamp ahead of the
+        // submitted counter is still sitting in an unsubmitted segment, and a
+        // submitted stamp needs its resolved fence signalled. Missing state never
+        // counts as finished.
+        if (l.fence[slot] > submitCounter_.load(std::memory_order_acquire)) return;
+        if (l.submitFence[slot] && vkGetFenceStatus(device_, l.submitFence[slot]) != VK_SUCCESS) return;
+    }
     ImageRes src = PrepareCopySource(t, &l.down); if (!src.Valid()) return;
     if (!l.rb[slot]) {
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size = uint64_t(l.gw) * l.gh * 4; ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (vkCreateBuffer(device_, &ci, nullptr, &l.rb[slot]) != VK_SUCCESS) return;
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(device_, l.rb[slot], &mr);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size;
-        ai.memoryTypeIndex = FindMemory(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (vkAllocateMemory(device_, &ai, nullptr, &l.rbm[slot]) != VK_SUCCESS) { vkDestroyBuffer(device_, l.rb[slot], nullptr); l.rb[slot] = VK_NULL_HANDLE; return; }
-        vkBindBufferMemory(device_, l.rb[slot], l.rbm[slot], 0);
+        // D6: sentinel/allocate/bind failures destroy the partial buffer and record
+        // nothing, instead of binding through a guessed type 0.
+        ai.memoryTypeIndex = FindHostMemory(mr.memoryTypeBits, l.rbCoherent[slot]);
+        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &ai, nullptr, &l.rbm[slot]) != VK_SUCCESS) { vkDestroyBuffer(device_, l.rb[slot], nullptr); l.rb[slot] = VK_NULL_HANDLE; return; }
+        if (vkBindBufferMemory(device_, l.rb[slot], l.rbm[slot], 0) != VK_SUCCESS) { vkDestroyBuffer(device_, l.rb[slot], nullptr); l.rb[slot] = VK_NULL_HANDLE; vkFreeMemory(device_, l.rbm[slot], nullptr); l.rbm[slot] = VK_NULL_HANDLE; return; }
     }
     Transition(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkBufferImageCopy region{}; region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.imageSubresource.layerCount = 1; region.imageExtent = {l.gw, l.gh, 1};
     vkCmdCopyImageToBuffer(Cmd(), src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, l.rb[slot], 1, &region);
-    l.fence[slot] = submitCounter_ + 1; l.frame[slot] = presents_; l.next = (slot + 1) % kFrames;
+    // D2/D3: stamp the slot recorded-but-unsubmitted, with the fence the next Submit
+    // of this segment will signal resolved now, on the render thread.
+    l.fence[slot] = submitCounter_.load(std::memory_order_relaxed) + 1; l.submitFence[slot] = Cur().fence; l.frame[slot] = presents_; l.next = (slot + 1) % kFrames;
 }
 void VulkanBackend::SetGamma(const uint8_t* ramp) {
     std::memcpy(ramp_, ramp, sizeof(ramp_));

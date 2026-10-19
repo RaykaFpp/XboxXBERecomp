@@ -120,8 +120,14 @@ void FinishHandover() {
         const uint8_t* p = &ready;
         size_t left = 1;
         while (left) {
-            ssize_t n = write(g_handover_fd, p, left);
+            // D5: send with MSG_NOSIGNAL, not write: the peer may already be gone
+            // (its 15 s deadline passed, or it crashed) and SIGPIPE is at its default
+            // disposition in this process, so a plain write would kill this new
+            // instance at its first frames. EPIPE is then just "no peer", handled
+            // exactly as ECONNREFUSED is on the connect path above: carry on alone.
+            ssize_t n = send(g_handover_fd, p, left, MSG_NOSIGNAL);
             if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EPIPE) break;
             if (n <= 0) {
                 LOGW("handover: signal failed (%s)", n < 0 ? std::strerror(errno) : "closed");
                 break;

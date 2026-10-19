@@ -17,6 +17,8 @@
 #include <dlfcn.h>
 #include <fstream>
 #include <mutex>
+#include <system_error>
+#include <unistd.h>
 #include <unordered_map>
 
 #include "core/log.h"
@@ -46,29 +48,70 @@ std::unordered_map<uint64_t, std::vector<uint32_t>> g_cache;
 std::filesystem::path g_dir;
 std::string g_compiler = "none";
 
+uint64_t CacheKey(const std::string& hlsl, const char* entry, bool fragment) {
+    uint64_t key = Hash(entry, std::strlen(entry), fragment ? 0x7073ull : 0x7673ull);
+    return Hash(hlsl.data(), hlsl.size(), key);
+}
+
 std::filesystem::path CacheFile(uint64_t key, bool fragment) {
     char name[48];
     std::snprintf(name, sizeof(name), "%016llx.%s.spv", (unsigned long long)key, fragment ? "ps" : "vs");
     return g_dir / name;
 }
 
+// D4: a cache blob is trusted only if it is a whole SPIR-V module, not merely a file
+// whose first word is the magic (the magic is written first, so every truncated
+// write used to pass). Checks: at least the 5-word header, a sane length, version
+// 1.x, a non-zero sane id bound, reserved schema word 0, and an instruction walk
+// that lands exactly on the end (a truncation behind the header ends mid-word-count).
+bool ValidSpirv(const std::vector<uint32_t>& words) {
+    constexpr size_t kMaxWords = 4u * 1024u * 1024u;  // 16 MiB: far above any shader this port generates
+    if (words.size() < 5 || words.size() > kMaxWords) return false;
+    if (words[0] != 0x07230203u) return false;  // magic
+    uint32_t version = words[1];
+    if (((version >> 16) & 0xffu) != 1u || ((version >> 8) & 0xffu) > 6u) return false;
+    uint32_t bound = words[3];
+    if (bound == 0 || bound > 0x400000u) return false;
+    if (words[4] != 0) return false;  // schema is reserved and must be 0
+    size_t at = 5;
+    while (at < words.size()) {
+        uint32_t count = words[at] >> 16;
+        if (count == 0 || at + count > words.size()) return false;
+        at += count;
+    }
+    return at == words.size();
+}
+
 bool ReadWords(const std::filesystem::path& path, std::vector<uint32_t>& words) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return false;
     std::streamsize bytes = f.tellg();
-    if (bytes <= 0 || bytes % 4) return false;
+    if (bytes < 20 || bytes % 4 || bytes > 16 * 1024 * 1024) return false;  // D4: header + sane length, before allocating
     words.resize(size_t(bytes) / 4);
     f.seekg(0);
     f.read(reinterpret_cast<char*>(words.data()), bytes);
-    // SPIR-V magic, little endian as both compilers emit it on this host
-    return f.good() && words[0] == 0x07230203u;
+    return f.good() && ValidSpirv(words);  // D4
 }
 
 void WriteWords(const std::filesystem::path& path, const std::vector<uint32_t>& words) {
+    // D4: write to a per-process temporary in the same directory, check the write,
+    // then rename over the target: a crash/kill/disk-full mid-write leaves the old
+    // entry (or nothing), never a truncated file at the cache name.
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (f) f.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+    std::filesystem::path tmp = path;
+    tmp += ".tmp." + std::to_string(static_cast<long long>(getpid()));
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f.write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+        f.flush();
+        if (!f.good()) { std::filesystem::remove(tmp, ec); return; }
+        f.close();
+        if (f.fail()) { std::filesystem::remove(tmp, ec); return; }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
 }
 
 #ifdef XBE_SPIRV_DXC
@@ -128,7 +171,7 @@ bool CompileDxc(const std::string& hlsl, const char* entry, bool fragment, std::
                 blob->GetBufferSize() % 4 == 0) {
                 words.assign(static_cast<const uint32_t*>(blob->GetBufferPointer()),
                              static_cast<const uint32_t*>(blob->GetBufferPointer()) + blob->GetBufferSize() / 4);
-                ok = !words.empty() && words[0] == 0x07230203u;
+                ok = ValidSpirv(words);  // D4: magic alone is not enough
             }
             if (blob) blob->Release();
         }
@@ -183,8 +226,8 @@ bool CompileGlslang(const std::string& hlsl, const char* entry, bool fragment, s
     options.disassemble = false;
     options.validate = true;
     glslang::GlslangToSpv(*program.getIntermediate(stage), words, nullptr, &options);
-    if (words.empty() || words[0] != 0x07230203u) {
-        if (error) *error = "glslang: no SPIR-V produced";
+    if (!ValidSpirv(words)) {  // D4
+        if (error) *error = "glslang: no valid SPIR-V produced";
         return false;
     }
     g_compiler = "glslang";
@@ -203,10 +246,26 @@ void SetSpirvCacheDir(std::filesystem::path dir, std::string device_key) {
     g_dir = dir / device_key;
 }
 
+void DiscardCachedSpirv(const std::string& hlsl, const char* entry, bool fragment) {
+    // D4: drop both the in-memory words and the on-disk entry, so the next attempt
+    // (and the next run) recompiles from HLSL instead of reusing a blob that
+    // vkCreateShaderModule rejected.
+    uint64_t key = CacheKey(hlsl, entry, fragment);
+    std::filesystem::path file;
+    {
+        std::lock_guard lock(g_lock);
+        g_cache.erase(key);
+        if (!g_dir.empty()) file = CacheFile(key, fragment);
+    }
+    if (!file.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
+    }
+}
+
 bool CompileHlslToSpirv(const std::string& hlsl, const char* entry, bool fragment, std::vector<uint32_t>& words,
                         std::string* error) {
-    uint64_t key = Hash(entry, std::strlen(entry), fragment ? 0x7073ull : 0x7673ull);
-    key = Hash(hlsl.data(), hlsl.size(), key);
+    uint64_t key = CacheKey(hlsl, entry, fragment);
     {
         std::lock_guard lock(g_lock);
         auto it = g_cache.find(key);
@@ -224,6 +283,10 @@ bool CompileHlslToSpirv(const std::string& hlsl, const char* entry, bool fragmen
         std::lock_guard lock(g_lock);
         g_cache[key] = words;
         return true;
+    }
+    if (!file.empty()) {  // D4: an entry that failed validation is discarded, not left for the next run
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
     }
     std::string dxc_error, glslang_error;
     bool ok = false;

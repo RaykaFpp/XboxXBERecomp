@@ -19,6 +19,11 @@ namespace gpu {
 bool CompileHlslToSpirv(const std::string& hlsl, const char* entry, bool fragment,
                         std::vector<uint32_t>& words, std::string* error = nullptr);
 
+// D4: forget one shader's cached SPIR-V, in memory and on disk. Called when a blob
+// that passed CompileHlslToSpirv is rejected by vkCreateShaderModule, so the next
+// attempt and the next run recompile from HLSL instead of reusing the bad entry.
+void DiscardCachedSpirv(const std::string& hlsl, const char* entry, bool fragment);
+
 // Where compiled SPIR-V (and, by the backend, its pipeline cache) is kept between runs: the
 // shadercache folder beside the exe. device_key names the adapter and driver the cache belongs
 // to, so a cache never crosses adapters; it becomes a folder name under dir.

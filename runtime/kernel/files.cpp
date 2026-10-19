@@ -585,6 +585,13 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
         case 4:  // basic, times and attributes are not kept
             break;
         case 30: {  // FileCompletionInformation: port handle, then the key every packet for this file carries
+            // D8: Finish reads completion_port/completion_key under f->io (held by
+            // Transfer across the whole transfer), so the reset, the assignment and
+            // the key all happen under that same mutex; otherwise a bind/unbind on
+            // one guest thread races a completing transfer on another on the
+            // shared_ptr itself. Lock order matches Transfer: f->io before the
+            // handle-table lock FromHandle takes below.
+            std::lock_guard<std::mutex> lock(f->io);
             if (len < 8) return kInvalidParameter;
             uint32_t port_handle = R32(in);
             if (!port_handle) {
