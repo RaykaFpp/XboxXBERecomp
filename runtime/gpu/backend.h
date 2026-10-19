@@ -38,6 +38,10 @@ public:
     virtual void RecordLate(uint32_t) {}
     virtual void Flush() = 0;
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
+    // the frame target is drawn app::AspectWiden() wider for an ultrawide output (Hor+): the XDK layer then moves the
+    // title's horizontal centre to the widened frame's centre. False draws the console's width and moves nothing.
+    // Asked of the backend CreateBackend made, once, before the render thread's wrapper takes it.
+    virtual bool WidensFrame() const { return true; }
 
     // the XDK's fences and busy checks against the render thread; a backend that draws at once is never behind
     virtual uint32_t Fence() { return ++fence_; }

@@ -300,6 +300,7 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
+    bool WidensFrame() const override { return false; }
 private:
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool fencePending = false;
@@ -366,6 +367,8 @@ private:
                                  const DrawTextures& stages, const std::array<VkSampler, 4>& samplers);
     void SetViewportScissor(const State& s, GuestExtent size, uint32_t targetW, uint32_t targetH);
     void DrawGeometry(const Assembled& a);
+    void LogDraw(const State& s, uint32_t prim, uint32_t count, const Assembled& a, const DrawShaders& sh, const DrawTextures& stages,
+                 const DrawConstants& c, GuestExtent size);
     void BeginTargetPass(Target* rt, Target* ds, VkFramebuffer& fbOut);
     void EndPass();
     void PrepareBlitSource(ImageRes& src, bool gamma);
@@ -888,13 +891,12 @@ void VulkanBackend::ResizeSwapIfNeeded(bool force) {
     g_handles.imageCount = uint32_t(swapImages_.size()); g_handles.minImageCount = std::max<uint32_t>(uint32_t(swapImages_.size()), 2);
 }
 // ---- targets ----
-// Hor+ ultrawide widening is NOT implemented on this backend yet: every
-// viewport, scissor and 2-D placement would have to shift by the widening
-// offset (dx) for the extra width to hold more world instead of stretching
-// the guest's 0..640 picture across a wider target, which read as the
-// picture being cut off. Until that is done as its own piece of work, the
-// frame target is exactly the guest's size at render scale (dx == 0), and
-// widen_/app::AspectWiden() is read for logging only.
+// Hor+ ultrawide widening is not implemented on this backend: the frame
+// target is exactly the guest's size at render scale (dx == 0), and
+// widen_/app::AspectWiden() is read for logging only. WidensFrame() says so
+// to the XDK layer, which then leaves the title's horizontal centre where the
+// console has it; while it moved it for a widening this target never had,
+// every 2-D draw and the world landed (widened - 640) / 2 guest pixels right.
 uint32_t VulkanBackend::WidenedGuestWidth() const { return guestW_; }
 GuestExtent VulkanBackend::BoundExtent(const Surface& s) const {
     GuestExtent e{}; SurfaceSize(s, e.w, e.h);
@@ -1241,7 +1243,9 @@ void MatMulC(const float* x, const float* y, float* o) {
 }
 void TransposeC(const float* m, float* o) { for (int r = 0; r < 4; r++) for (int col = 0; col < 4; col++) o[col * 4 + r] = m[r * 4 + col]; }
 void VulkanBackend::FillConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, GuestExtent size, DrawConstants& c) {
-    c.surf[0] = float(size.w); c.surf[1] = float(size.h); c.surf[2] = 1.0f / s.zscale;
+    // a vertex program's screen space positions are the render target's pixels, SuperSampleScale of them to each of
+    // the frame's on a supersampled back buffer; fixed function and pretransformed positions stay in the frame's
+    c.surf[0] = float(size.w) * (sh.prog ? s.super_x : 1.0f); c.surf[1] = float(size.h) * (sh.prog ? s.super_y : 1.0f); c.surf[2] = 1.0f / s.zscale;
     ColorF(s.rs[kRsFogColor], c.fog_color);
     c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
     c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(CmpIndex(SimpleState(s, kMAlphaFunc))) : 7.0f;
@@ -1436,6 +1440,180 @@ void BuildPsoKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, T
     }
     uint32_t cull = s.rs[kRsCullMode]; k.cull = cull != 0 && a.topology == Topology::Triangles; k.ccw = cull == 0x900; k.fill = s.rs[kRsFillMode];
 }
+// ---- XBE_VK_DEBUG_DRAW: one draw in full, every 60th present ----
+// The vertex stage worked on the CPU the way the generated HLSL does it (VertexProgramHlsl's microcode
+// fields, FixedVertexHlsl's pretransformed path, kVsEpilogue's pixel to clip step), so the log states
+// where a draw lands and what it samples instead of leaving it to be guessed from a picture.
+uint32_t VsField(const uint32_t* t, int sub, int bit, int len) { return (t[sub] >> bit) & ((1u << len) - 1); }
+void VsWrite(float* dst, const float* src, uint32_t mask) { for (int i = 0; i < 4; i++) if ((mask >> (3 - i)) & 1) dst[i] = src[i]; }
+float VsMagClamp(float v) { float m = std::clamp(std::fabs(v), 5.42101e-20f, 1.84467e+19f); return v < 0 ? -m : m; }
+// out: by output register, 0 oPos, 3 oD0, 4 oD1, 5 oFog, 6 oPts, 7 oB0, 8 oB1, 9 to 12 oT0 to oT3
+void EvalVertexProgram(const std::vector<uint32_t>& prog, uint16_t regs, const float (&v)[16][4], const std::array<std::array<float, 4>, 192>& c,
+                       float (&out)[16][4], std::vector<int>& reads) {
+    float R[13][4] = {};  // R0 to R11, R12 is oPos
+    std::memset(out, 0, sizeof(out));
+    for (int o : {3, 7, 9, 10, 11, 12}) out[o][3] = 1;
+    out[6][0] = out[6][1] = out[6][2] = out[6][3] = 1;
+    int a0 = 0;
+    auto operand = [&](const uint32_t* t, int which, float (&o)[4]) {
+        uint32_t neg, sw[4], reg, mux;
+        if (which == 0) { neg = VsField(t, 1, 8, 1); sw[0] = VsField(t, 1, 6, 2); sw[1] = VsField(t, 1, 4, 2); sw[2] = VsField(t, 1, 2, 2); sw[3] = VsField(t, 1, 0, 2); reg = VsField(t, 2, 28, 4); mux = VsField(t, 2, 26, 2); }
+        else if (which == 1) { neg = VsField(t, 2, 25, 1); sw[0] = VsField(t, 2, 23, 2); sw[1] = VsField(t, 2, 21, 2); sw[2] = VsField(t, 2, 19, 2); sw[3] = VsField(t, 2, 17, 2); reg = VsField(t, 2, 13, 4); mux = VsField(t, 2, 11, 2); }
+        else {
+            neg = VsField(t, 2, 10, 1); sw[0] = VsField(t, 2, 8, 2); sw[1] = VsField(t, 2, 6, 2); sw[2] = VsField(t, 2, 4, 2); sw[3] = VsField(t, 2, 2, 2);
+            reg = VsField(t, 2, 0, 2) << 2 | VsField(t, 3, 30, 2); mux = VsField(t, 3, 28, 2);
+            uint32_t ilu = VsField(t, 1, 25, 3); if (ilu >= 2 && ilu <= 6) sw[1] = sw[2] = sw[3] = sw[0];
+        }
+        const float one[4] = {1, 1, 1, 1}, unit[4] = {0, 0, 0, 1}; const float* base;
+        if (mux == 1) base = R[std::min<uint32_t>(reg, 12)];
+        else if (mux == 2) { uint32_t vi = VsField(t, 1, 9, 4); base = (regs >> vi) & 1 ? v[vi] : vi == 3 ? one : unit; }
+        else { uint32_t cr = VsField(t, 1, 13, 8); int idx = VsField(t, 3, 1, 1) ? std::clamp(a0 + int(cr), 0, 191) : int(cr); base = c[size_t(idx)].data(); reads.push_back(idx); }
+        for (int i = 0; i < 4; i++) o[i] = neg ? -base[sw[i]] : base[sw[i]];
+    };
+    for (size_t n = 0; n + 4 <= prog.size(); n += 4) {
+        const uint32_t* t = &prog[n];
+        uint32_t mac = VsField(t, 1, 21, 4), ilu = VsField(t, 1, 25, 3);
+        if (mac || ilu) {
+            float A[4], B[4], C[4], mr[4] = {}, ir[4] = {};
+            operand(t, 0, A); operand(t, 1, B); operand(t, 2, C);
+            auto mul = [](float x, float y) { return x == 0 || y == 0 ? 0.0f : x * y; };
+            switch (mac) {
+                case 1: case 13: std::memcpy(mr, A, sizeof(mr)); break;
+                case 2: for (int i = 0; i < 4; i++) mr[i] = mul(A[i], B[i]); break;
+                case 3: for (int i = 0; i < 4; i++) mr[i] = A[i] + C[i]; break;
+                case 4: for (int i = 0; i < 4; i++) mr[i] = mul(A[i], B[i]) + C[i]; break;
+                case 5: mr[0] = mr[1] = mr[2] = mr[3] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2]; break;
+                case 6: mr[0] = mr[1] = mr[2] = mr[3] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + B[3]; break;
+                case 7: mr[0] = mr[1] = mr[2] = mr[3] = A[0] * B[0] + A[1] * B[1] + A[2] * B[2] + A[3] * B[3]; break;
+                case 8: mr[0] = 1; mr[1] = A[1] * B[1]; mr[2] = A[2]; mr[3] = B[3]; break;
+                case 9: for (int i = 0; i < 4; i++) mr[i] = std::min(A[i], B[i]); break;
+                case 10: for (int i = 0; i < 4; i++) mr[i] = std::max(A[i], B[i]); break;
+                case 11: for (int i = 0; i < 4; i++) mr[i] = A[i] < B[i] ? 1.0f : 0.0f; break;
+                case 12: for (int i = 0; i < 4; i++) mr[i] = A[i] >= B[i] ? 1.0f : 0.0f; break;
+                default: break;
+            }
+            float x = C[0], whole = std::floor(x), mag = std::fabs(x), l2 = std::log2(mag), ex = std::floor(l2);
+            switch (ilu) {
+                case 1: std::memcpy(ir, C, sizeof(ir)); break;
+                case 2: ir[0] = ir[1] = ir[2] = ir[3] = 1.0f / x; break;
+                case 3: ir[0] = ir[1] = ir[2] = ir[3] = VsMagClamp(1.0f / x); break;
+                case 4: ir[0] = ir[1] = ir[2] = ir[3] = x == 0 ? INFINITY : 1.0f / std::sqrt(mag); break;
+                case 5: ir[0] = std::exp2(whole); ir[1] = x - whole; ir[2] = std::exp2(x); ir[3] = 1; break;
+                case 6: if (mag == 0) { ir[0] = ir[2] = -INFINITY; ir[1] = ir[3] = 1; } else { ir[0] = ex; ir[1] = mag / std::exp2(ex); ir[2] = l2; ir[3] = 1; } break;
+                case 7: { const float cap = 127.99609375f; float d = std::max(C[0], 0.0f);
+                          ir[0] = 1; ir[1] = d; ir[2] = d > 0 ? std::exp2(std::clamp(C[3], -cap, cap) * std::log2(std::max(C[1], 0.0f))) : 0; ir[3] = 1; break; }
+                default: break;
+            }
+            uint32_t r = VsField(t, 3, 20, 4), omask = VsField(t, 3, 12, 4);
+            if (mac == 13) a0 = int(std::floor(mr[0] + 1e-3f));
+            else if (mac) { uint32_t m = VsField(t, 3, 24, 4); if (ilu && r == 1) m = 0; if (m && r <= 12) VsWrite(R[r], mr, m); }
+            if (ilu) { uint32_t m = VsField(t, 3, 16, 4), d = mac ? 1 : r; if (m && d <= 12) VsWrite(R[d], ir, m); }
+            bool useIlu = VsField(t, 3, 2, 1) == 1;
+            if (omask && VsField(t, 3, 11, 1) && ((useIlu && ilu) || (!useIlu && mac && mac != 13))) {
+                uint32_t o = VsField(t, 3, 3, 8) & 0xF;
+                VsWrite(o == 0 ? R[12] : out[o], useIlu ? ir : mr, omask);
+            }
+        }
+        if (VsField(t, 3, 0, 1)) break;
+    }
+    std::memcpy(out[0], R[12], sizeof(out[0]));
+}
+// one register of one vertex as the shader reads it: the element's components, (0, 0, 0, 1) behind them, then
+// the decode the vertex shader finishes a raw element with
+void ReadVertexRegister(const Assembled& a, int r, uint32_t vtx, float (&o)[4]) {
+    o[0] = o[1] = o[2] = 0; o[3] = 1;
+    const VertexElement& e = a.elements[size_t(r)]; const VertexBuffer& vb = a.buffers[e.buffer];
+    if (!vb.src || !vb.stride || uint64_t(vtx + 1) * vb.stride > vb.bytes) return;
+    const uint8_t* p = vb.src + size_t(vtx) * vb.stride + e.offset;
+    auto f32 = [&](int n) { std::memcpy(o, p, size_t(n) * 4); };
+    auto i16 = [&](int n, float div) { for (int i = 0; i < n; i++) { int16_t x; std::memcpy(&x, p + i * 2, 2); o[i] = div ? std::max(x / div, -1.0f) : float(x); } };
+    auto u8 = [&](int n) { for (int i = 0; i < n; i++) o[i] = p[i] / 255.0f; };
+    switch (e.format) {
+        case kDxgiRgba32f: f32(4); break; case kDxgiRgb32f: f32(3); break; case kDxgiRg32f: f32(2); break; case kDxgiR32f: f32(1); break;
+        case kDxgiR32u: { uint32_t u; std::memcpy(&u, p, 4); o[0] = float(u); break; }
+        case kDxgiRgba16Snorm: i16(4, 32767); break; case kDxgiRg16Snorm: i16(2, 32767); break; case kDxgiR16Snorm: i16(1, 32767); break;
+        case kDxgiRgba16Sint: i16(4, 0); break; case kDxgiRg16Sint: i16(2, 0); break; case kDxgiR16Sint: i16(1, 0); break;
+        case kDxgiRgba8: u8(4); break; case kDxgiRg8: u8(2); break; case kDxgiR8: u8(1); break;
+        case kDxgiBgra8: o[0] = p[2] / 255.0f; o[1] = p[1] / 255.0f; o[2] = p[0] / 255.0f; o[3] = p[3] / 255.0f; break;
+        default: break;
+    }
+    switch (uint32_t(a.decode >> (r * 4)) & 15) {
+        case kDecodeW1: case kDecodeIntW1: o[3] = 1; break;
+        case kDecodePacked: { uint32_t u; std::memcpy(&u, p, 4);
+            o[0] = std::max(float(int32_t(u << 21) >> 21) / 1023.0f, -1.0f); o[1] = std::max(float(int32_t(u << 10) >> 21) / 1023.0f, -1.0f);
+            o[2] = std::max(float(int32_t(u) >> 22) / 511.0f, -1.0f); o[3] = 1; break; }
+        case kDecodeFloat2H: o[3] = o[2]; o[2] = 0; break;
+        default: break;
+    }
+}
+void VulkanBackend::LogDraw(const State& s, uint32_t prim, uint32_t count, const Assembled& a, const DrawShaders& sh, const DrawTextures& stages,
+                            const DrawConstants& c, GuestExtent size) {
+    const Target* rt = boundRt_ ? boundRt_ : boundDs_;
+    const uint32_t W = rt ? rt->w : 0, H = rt ? rt->h : 0;
+    LOGI("vk-draw: present %llu rt %08X prim %u count %u | %u vertices, %u indices, draw count %u, topology %u strip %d",
+         (unsigned long long)presents_, s.rt.data, prim, count, a.vertex_count, a.index_count, a.draw_count, uint32_t(a.topology), int(a.strip));
+    LOGI("vk-draw:  vertex shader %08X: %s, pretransformed %d, quad %d, registers %04X, decode %llX",
+         s.vs_handle, sh.prog ? "program" : "fixed function (FVF)", int(a.pretransformed), int(sh.quad), a.regs, (unsigned long long)a.decode);
+    if (s.vs && (s.vs_handle & 1)) {
+        std::string decl; char tok[16];
+        for (uint32_t d : s.vs->decl) { std::snprintf(tok, sizeof(tok), " %08X", d); decl += tok; }
+        LOGI("vk-draw:  declaration%s | program %zu instructions", decl.c_str(), s.vs->program.size() / 4);
+    }
+    const auto& v = s.viewport;
+    std::string sc; char buf[96];
+    for (uint32_t i = 0; i < s.scissor_count; i++) { std::snprintf(buf, sizeof(buf), " (%u,%u)-(%u,%u)", s.scissors[i * 4], s.scissors[i * 4 + 1], s.scissors[i * 4 + 2], s.scissors[i * 4 + 3]); sc += buf; }
+    LOGI("vk-draw:  viewport (%u,%u %ux%u z %.3f..%.3f) scissors %u%s | screen space offset (%.5f,%.5f) zscale %.0f | multisample antialias %u mask %08X mode %u rendertarget mode %u",
+         v.x, v.y, v.w, v.h, double(v.min_z), double(v.max_z), s.scissor_count, sc.c_str(), double(s.ss_offset_x), double(s.ss_offset_y), double(s.zscale),
+         s.rs[kRsMultiSampleAntiAlias], s.rs[kRsMultiSampleMask], s.rs[kRsMultiSampleMode], s.rs[kRsMultiSampleRenderTargetMode]);
+    LOGI("vk-draw:  target guest %ux%u host %ux%u (render scale %.3f) | guest extent %ux%u dx %.1f supersample %.0fx%.0f | surf (%.1f, %.1f, %.3g)",
+         rt ? rt->gw : 0, rt ? rt->gh : 0, W, H, double(scale_), size.w, size.h, double(size.dx), double(s.super_x), double(s.super_y),
+         double(c.surf[0]), double(c.surf[1]), double(c.surf[2]));
+    for (int i = 0; i < 4; i++) {
+        if (!stages.hasDesc[i]) continue;
+        const TextureDesc& d = stages.desc[i];
+        LOGI("vk-draw:  stage %d texture %08X format %02X %s %ux%u depth %u levels %u pitch %u linear %d cube %d, %u bytes | target %d kind %u rect %u | texsize (%.0f, %.0f, %.6f, %.6f) uvrect (%.5f,%.5f)-(%.5f,%.5f)",
+             i, d.data, d.format, Format(d.format).name, d.width, d.height, d.depth, d.levels, d.pitch, int(d.linear), int(d.cube), TotalSize(d),
+             int(stages.rt[i]), stages.info[i].kind, stages.info[i].rect, double(c.texsize[i][0]), double(c.texsize[i][1]), double(c.texsize[i][2]), double(c.texsize[i][3]),
+             double(c.uvrect[i][0]), double(c.uvrect[i][1]), double(c.uvrect[i][2]), double(c.uvrect[i][3]));
+    }
+    for (int r = 0; r < 16; r++) if ((a.regs >> r) & 1) {
+        const VertexElement& e = a.elements[size_t(r)];
+        LOGI("vk-draw:  register %d: format %u, buffer %u offset %u stride %u", r, e.format, e.buffer, e.offset, a.buffers[e.buffer].stride);
+    }
+    std::vector<int> reads;
+    for (uint32_t vtx = 0; vtx < std::min(a.vertex_count, 4u); vtx++) {
+        float in[16][4] = {}, out[16][4] = {};
+        std::string regs;
+        for (int r = 0; r < 16; r++) if ((a.regs >> r) & 1) {
+            ReadVertexRegister(a, r, vtx, in[r]);
+            std::snprintf(buf, sizeof(buf), " v%d (%.4f, %.4f, %.4f, %.4f)", r, double(in[r][0]), double(in[r][1]), double(in[r][2]), double(in[r][3])); regs += buf;
+        }
+        LOGI("vk-draw:  vertex %u:%s", vtx, regs.c_str());
+        float p[4];
+        if (sh.prog) { EvalVertexProgram(s.vs->program, a.regs, in, s.vsc, out, reads); std::memcpy(p, out[0], sizeof(p)); }
+        else if (a.pretransformed) { p[0] = in[0][0]; p[1] = in[0][1]; p[2] = in[0][2] / c.surf[2]; p[3] = in[0][3] == 0 ? 1 : 1 / in[0][3]; std::memcpy(out[9], in[9], sizeof(out[9])); }
+        else {
+            // FillConstants' wvp already holds the viewport: clip space straight out, shown here as the pixel that is
+            float cp[4]; for (int i = 0; i < 4; i++) cp[i] = in[0][0] * c.wvp[i * 4] + in[0][1] * c.wvp[i * 4 + 1] + in[0][2] * c.wvp[i * 4 + 2] + c.wvp[i * 4 + 3];
+            p[0] = (cp[0] / cp[3] + 1) * 0.5f * c.surf[0]; p[1] = (1 - cp[1] / cp[3]) * 0.5f * c.surf[1]; p[2] = cp[2] / cp[3] / c.surf[2]; p[3] = cp[3];
+            std::memcpy(out[9], in[9], sizeof(out[9]));
+        }
+        // kVsEpilogue: a pass ending half a pixel short of the far edges is pulled out to them, then pixels to clip
+        float px = std::fabs(p[0] - (c.surf[0] - 0.5f)) < 1e-3f ? c.surf[0] : p[0], py = std::fabs(p[1] - (c.surf[1] - 0.5f)) < 1e-3f ? c.surf[1] : p[1];
+        float nx = px * 2 / c.surf[0] - 1, ny = 1 - py * 2 / c.surf[1], nz = p[2] * c.surf[2];
+        float hx = (nx + 1) * 0.5f * float(W), hy = (1 - ny) * 0.5f * float(H);
+        const float* tc = out[9]; float uv[2] = {tc[0], tc[1]};
+        if (sh.prog && tc[3] != 0) { uv[0] /= tc[3]; uv[1] /= tc[3]; }
+        if (stages.hasDesc[0] && stages.info[0].rect) { uv[0] /= c.texsize[0][0]; uv[1] /= c.texsize[0][1]; }
+        uv[0] += c.texsize[0][2]; uv[1] += c.texsize[0][3];
+        LOGI("vk-draw:  vertex %u: oPos (%.4f, %.4f, %.4f, %.4f) -> clip (%.5f, %.5f, %.5f) -> host pixel (%.2f, %.2f) = guest pixel (%.3f, %.3f) | oT0 (%.4f, %.4f, %.4f, %.4f) -> uv (%.5f, %.5f)",
+             vtx, double(p[0]), double(p[1]), double(p[2]), double(p[3]), double(nx), double(ny), double(nz), double(hx), double(hy),
+             double(W ? hx * float(size.w) / float(W) : 0), double(H ? hy * float(size.h) / float(H) : 0),
+             double(tc[0]), double(tc[1]), double(tc[2]), double(tc[3]), double(uv[0]), double(uv[1]));
+    }
+    std::sort(reads.begin(), reads.end()); reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+    for (int r : reads) LOGI("vk-draw:  c[%d] (D3D c%d) = (%.4f, %.4f, %.4f, %.4f)", r, r - 96, double(s.vsc[size_t(r)][0]), double(s.vsc[size_t(r)][1]), double(s.vsc[size_t(r)][2]), double(s.vsc[size_t(r)][3]));
+}
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     VkPerfScope perfDraw{g_vkPerf.draw};
     g_vkPerf.draws++;
@@ -1456,50 +1634,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     VkPipeline pso = EnsurePipeline(k, sh.vs, sh.ps); if (!pso) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; return; }
     GuestExtent size = BoundExtent(boundRt_ ? s.rt : s.zs);
     DrawConstants c{}; FillUvRect(s, prim, count, a, sh, stages, c); FillConstants(s, sh, stages, size, c);
-    {
-        static const bool debugDraw = std::getenv("XBE_VK_DEBUG_DRAW") != nullptr;
-        if (debugDraw && presents_ % 60 == 0) {
-            LOGI("vk-draw: present %llu rt %08X prim %u count %u verts %u prog %d quad %d regs %04X uvrect0 (%.3f,%.3f)-(%.3f,%.3f) texsize0 %.0fx%.0f",
-                 (unsigned long long)presents_, s.rt.data, prim, count, a.vertex_count, int(sh.prog), int(sh.quad), a.regs,
-                 c.uvrect[0][0], c.uvrect[0][1], c.uvrect[0][2], c.uvrect[0][3], c.texsize[0][0], c.texsize[0][1]);
-            LOGI("vk-draw:  viewport (%u,%u %ux%u) surf %.0fx%.0f size %ux%u dx %.1f boundRt host %ux%u guest %ux%u data %08X",
-                 s.viewport.x, s.viewport.y, s.viewport.w, s.viewport.h, c.surf[0], c.surf[1], size.w, size.h, double(size.dx),
-                 boundRt_ ? boundRt_->w : 0, boundRt_ ? boundRt_->h : 0, boundRt_ ? boundRt_->gw : 0, boundRt_ ? boundRt_->gh : 0, boundRt_ ? boundRt_->data : 0);
-            for (int r = 121; r < 125; r++) LOGI("vk-draw:  VC[%d] = (%.3f,%.3f,%.3f,%.3f)", r, s.vsc[size_t(r)][0], s.vsc[size_t(r)][1], s.vsc[size_t(r)][2], s.vsc[size_t(r)][3]);
-            for (int r : {58, 59, 97, 98}) LOGI("vk-draw:  VC[%d] = (%.3f,%.3f,%.3f,%.3f)", r, s.vsc[size_t(r)][0], s.vsc[size_t(r)][1], s.vsc[size_t(r)][2], s.vsc[size_t(r)][3]);
-            for (int i = 0; i < 4; i++) if (stages.hasDesc[i]) {
-                const TextureDesc& d = stages.desc[i];
-                LOGI("vk-draw:  stage %d fmt %02X %ux%u levels %u linear %d pitch %u data %08X view %p rt %d kind %d", i, d.format, d.width, d.height, d.levels, int(d.linear), d.pitch, d.data, (void*)stages.view[i], int(stages.rt[i]), int(stages.info[i].kind));
-                if (i == 0 && !stages.rt[i] && d.width && d.height) {
-                    std::vector<uint8_t> px; uint32_t pitch = 0;
-                    DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, px, pitch);
-                    if (!px.empty() && pitch) {
-                        uint64_t sum[4] = {}; uint8_t mn[4] = {255,255,255,255}, mx[4] = {};
-                        size_t npix = px.size() / 4;
-                        for (size_t k = 0; k < npix; k++) for (int ch = 0; ch < 4; ch++) { uint8_t v = px[k*4+ch]; sum[ch]+=v; mn[ch]=std::min(mn[ch],v); mx[ch]=std::max(mx[ch],v); }
-                        auto pix = [&](uint32_t x, uint32_t y){ const uint8_t* p=&px[(size_t(y)*d.width+x)*4]; return std::array<int,4>{p[0],p[1],p[2],p[3]}; };
-                        auto c0 = pix(0,0), cc = pix(d.width/2,d.height/2), c1 = pix(d.width-1,d.height-1);
-                        LOGI("vk-draw:  stage0 decoded mean (%llu,%llu,%llu) min (%u,%u,%u) max (%u,%u,%u) px00 (%d,%d,%d) pxC (%d,%d,%d) pxEnd (%d,%d,%d)",
-                             (unsigned long long)(sum[0]/npix),(unsigned long long)(sum[1]/npix),(unsigned long long)(sum[2]/npix), mn[0],mn[1],mn[2], mx[0],mx[1],mx[2], c0[0],c0[1],c0[2], cc[0],cc[1],cc[2], c1[0],c1[1],c1[2]);
-                    }
-                }
-            }
-            for (int r = 0; r < 16; r++) if ((a.regs >> r) & 1) {
-                const auto& e = a.elements[size_t(r)];
-                LOGI("vk-draw:  reg %d fmt %u buf %u off %u", r, e.format, e.buffer, e.offset);
-            }
-            LOGI("vk-draw:  buffers %u indices %u drawcount %u", a.buffer_count, a.index_count, a.draw_count);
-            for (uint32_t b = 0; b < a.buffer_count; b++) LOGI("vk-draw:  buffer %u stride %u bytes %u src %p", b, a.buffers[b].stride, a.buffers[b].bytes, (const void*)a.buffers[b].src);
-            for (int r = 0; r < 16; r++) if ((a.regs >> r) & 1) {
-                const auto& e = a.elements[size_t(r)]; const auto& vb = a.buffers[e.buffer];
-                if (!vb.src || !vb.stride) continue;
-                for (uint32_t v = 0; v < std::min(a.vertex_count, 4u); v++) {
-                    float f[4] = {}; std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, sizeof(f));
-                    LOGI("vk-draw:  v%u reg %d = (%.3f,%.3f,%.3f,%.3f)", v, r, f[0], f[1], f[2], f[3]);
-                }
-            }
-        }
-    }
+    static const bool debugDraw = std::getenv("XBE_VK_DEBUG_DRAW") != nullptr;
+    if (debugDraw && presents_ % 60 == 0) LogDraw(s, prim, count, a, sh, stages, c, size);
     Alloc vc = UploadAlloc(sizeof(s.vsc), 256); Alloc dc = UploadAlloc(sizeof(DrawConstants), 256);
     if (!vc.cpu || !dc.cpu) { g_vkPerf.skipped++; return; }
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc)); std::memcpy(dc.cpu, &c, sizeof(c));

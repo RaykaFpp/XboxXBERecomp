@@ -118,6 +118,7 @@ void Refresh(const void* p, uint32_t va, size_t n) {
 }
 
 std::unique_ptr<gpu::Backend> g_backend;
+bool g_frame_widened = true;  // gpu::Backend::WidensFrame of the backend CreateBackend made, before any wrapper
 std::recursive_mutex g_lock;
 
 std::unordered_map<uint32_t, std::shared_ptr<gpu::VertexShader>> g_vs;
@@ -222,13 +223,42 @@ float ZScale(const gpu::Surface& zs) {
 // console pixels is a scale and an offset: the scale stays, so the picture keeps its pixels per degree and its
 // vertical field of view, and the offset moves to the widened frame's centre. Hor+, no stretch. Only the main
 // frame grows, so a pass drawn into an off-screen surface of another size keeps its own centre and its own
-// numbers. Zero on 16:9 or with ultrawide off, and then nothing below it runs.
+// numbers. Zero on 16:9, with ultrawide off, or when the backend draws the console's width
+// (gpu::Backend::WidensFrame), and then nothing below it runs. In render target pixels: a supersampled back
+// buffer has SuperSampleScale of them to each pixel of the frame.
 float FrameCentreShift() {
+    if (!g_frame_widened) return 0;
     float dx = float(std::lround(g_frame_w * app::AspectWiden()) - long(g_frame_w)) * 0.5f;
     if (dx == 0) return 0;
     uint32_t w = 0, h = 0;
     gpu::SurfaceSize(g_state.rt.header ? g_state.rt : g_state.zs, w, h);
-    return w == g_frame_w && h == g_frame_h ? dx : 0;
+    return w == g_frame_w && h == g_frame_h ? dx * g_state.super_x : 0;
+}
+
+// D3DMULTISAMPLE_TYPE: x samples in bits 4 to 7, y in bits 0 to 3, 0x2000 a supersampling type. A supersampled back
+// buffer is that many times the frame on each axis and is filtered down to it at present (this title asks for
+// 0x2222, D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_GAUSSIAN, and doubles its own vertex program positions to match);
+// NONE (0x11) and the multisample types keep the frame's pixels.
+uint32_t g_super_x = 1, g_super_y = 1;  // the presentation's, on its back buffers
+
+void SetMultiSampleType(uint32_t type) {
+    bool super = type & 0x2000;
+    g_super_x = super ? std::max(1u, type >> 4 & 0xF) : 1;
+    g_super_y = super ? std::max(1u, type & 0xF) : 1;
+}
+
+// The render target's SuperSampleScale as the library keeps it: the presentation's on a back buffer, 1 on any other
+// surface. Into the device, where the library's own viewport, scissor and clear code reads it, and into g_state for
+// the renderer. The title's surfaces stay the frame's size: only screen space positions are in the larger pixels.
+void UpdateSuperSample() {
+    uint32_t rt = Dev(kDevRenderTarget);
+    bool back = false;
+    for (uint32_t i = 1; i < g_buffer_count; i++) back |= rt == g_buffers[i];
+    float x = back ? float(g_super_x) : 1.0f, y = back ? float(g_super_y) : 1.0f;
+    std::memcpy(HostPtr(kDevice + kDevSuperX), &x, 4);
+    std::memcpy(HostPtr(kDevice + kDevSuperY), &y, 4);
+    Set(g_state.super_x, x);
+    Set(g_state.super_y, y);
 }
 
 constexpr uint32_t kVscCount = 192;
@@ -271,14 +301,15 @@ void StoreVsConstants(uint32_t reg, uint32_t n, uint32_t data) {
 
 bool g_own_constants = false;  // D3DSCM_NORESERVEDCONSTANTS: c-38 and c-37 are the title's
 
-// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them
+// c-38 and c-37 hold the viewport scale and offset, as D3D_GetViewportOffsetAndScale computes them: in render target
+// pixels, SuperSampleScale of them to each of the viewport's
 void UpdateViewportConstants() {
     auto& v = g_state.viewport;
     Set(g_state.zscale, ZScale(g_state.zs));
-    float hw = v.w * 0.5f, hh = v.h * 0.5f;
+    float hw = v.w * 0.5f, hh = v.h * 0.5f, sx = g_state.super_x, sy = g_state.super_y;
     if (!g_own_constants) {
-        Set(g_state.vsc[58], {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0});
-        Set(g_state.vsc[59], {v.x + g_state.ss_offset_x + hw + FrameCentreShift(), v.y + g_state.ss_offset_y + hh,
+        Set(g_state.vsc[58], {hw * sx, -hh * sy, (v.max_z - v.min_z) * g_state.zscale, 0});
+        Set(g_state.vsc[59], {(v.x + g_state.ss_offset_x + hw) * sx + FrameCentreShift(), (v.y + g_state.ss_offset_y + hh) * sy,
                               v.min_z * g_state.zscale, 0});
     }
     // the viewport as the library's SetViewport stores it, for inlined readers
@@ -358,10 +389,11 @@ namespace {
 // physical 0, whose read-back then wrote over low kernel memory). Changed parameters
 // still allocate fresh surfaces and leak the old ones, as before: the title may hold
 // their headers, and a size/format change is rare.
-void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, uint32_t count, uint32_t auto_depth,
-                       uint32_t depth_fmt, bool fresh) {
+void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, uint32_t count, uint32_t multisample,
+                       uint32_t auto_depth, uint32_t depth_fmt, bool fresh) {
     g_frame_w = w;
     g_frame_h = h;
+    SetMultiSampleType(multisample);
     uint32_t color_fmt = gpu::LinearColorFormat(fmt);
     const uint32_t want_count = std::min<uint32_t>(count + 1, 3);
     static uint32_t pres_w = 0, pres_h = 0, pres_fmt = 0, pres_count = 0, pres_auto_depth = 0, pres_depth_fmt = 0;
@@ -381,6 +413,7 @@ void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, ui
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
         if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
+        g_frame_widened = g_backend->WidensFrame();
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
     // CreateDevice starts from a clean slate; Reset (like the guest body, which only
@@ -393,8 +426,6 @@ void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, ui
     SetDev(kDevBackBuffer, g_buffers[1]);
     SetDev(kDevFrontBuffer, g_buffers[1]);
     float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
-    std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
-    std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
     std::memcpy(HostPtr(kDevice + kDevZScale), &zs, 4);
     // fields the library's init sets that inlined library code and the default states read
     if (XDK_CDevice_AutoDepth != xdk::kUnknown) SetDev(XDK_CDevice_AutoDepth, g_depth);
@@ -417,6 +448,7 @@ void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, ui
     }
     Set(g_state.rt, SurfaceOf(g_buffers[1]));
     Set(g_state.zs, SurfaceOf(g_depth));
+    UpdateSuperSample();
     UpdateViewportConstants();
     if (fresh) ApplyDefaultStates(ctx);
 }
@@ -439,12 +471,12 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
     if (!w) w = 640;
     if (!h) h = 480;
-    LOGI("d3d: CreateDevice %ux%u format %X buffers %u depth %u format %X interval %X flags %X", w, h, fmt, count,
-         auto_depth, depth_fmt, interval, R32(pp + 0x28));
+    LOGI("d3d: CreateDevice %ux%u format %X buffers %u multisample %X depth %u format %X interval %X flags %X", w, h, fmt,
+         count, R32(pp + 0x10), auto_depth, depth_fmt, interval, R32(pp + 0x28));
     std::memset(HostPtr(kDevice), 0, XDK_CDevice_Size);
     W32(kDevicePtr, kDevice);
     ScratchPush();
-    SetupPresentation(ctx, w, h, fmt, count, auto_depth, depth_fmt, true);
+    SetupPresentation(ctx, w, h, fmt, count, R32(pp + 0x10), auto_depth, depth_fmt, true);
     if (a[5]) W32(a[5], kDevice);
     return 0;
 }
@@ -468,7 +500,7 @@ HLE_STDCALL(D3DDevice_Reset, 1) {
          w, h, fmt, count, R32(pp + 0x10), auto_depth, depth_fmt, R32(pp + 0x28), R32(pp + 0x2C), interval);
     if (g_backend) g_backend->Flush();  // the guest's KickOffAndWaitForIdle
     ScratchPush();
-    SetupPresentation(ctx, w, h, fmt, count, auto_depth, depth_fmt, false);
+    SetupPresentation(ctx, w, h, fmt, count, R32(pp + 0x10), auto_depth, depth_fmt, false);
     // the guest tail: SetRenderTarget(back buffer, auto depth) then Clear(0, 0, 3, 0, 1.0f, 0);
     // SetupPresentation already pointed the device and g_state at the new buffers
     if (g_backend) g_backend->Clear(g_state, 0, nullptr, 3, 0, 1.0f, 0);
@@ -616,6 +648,7 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     Release(ctx, old_zs);
     Set(g_state.rt, SurfaceOf(rt));
     Set(g_state.zs, SurfaceOf(zs));
+    UpdateSuperSample();
     // SetRenderTarget resets the viewport to the whole target
     uint32_t w, h;
     gpu::SurfaceSize(g_state.rt, w, h);

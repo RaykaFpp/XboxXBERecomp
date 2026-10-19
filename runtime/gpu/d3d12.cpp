@@ -2216,9 +2216,11 @@ void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
     c.fog[3] = float(s.rs[kRsFogTableMode]);
 }
 
-void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
-    c.surf[0] = float(size.w);
-    c.surf[1] = float(size.h);
+// a vertex program's screen space positions are the render target's pixels, SuperSampleScale of them to each of the
+// frame's on a supersampled back buffer; fixed function and pretransformed positions stay in the frame's
+void FillSurfaceConstants(const State& s, GuestExtent size, bool vertex_program, DrawConstants& c) {
+    c.surf[0] = float(size.w) * (vertex_program ? s.super_x : 1.0f);
+    c.surf[1] = float(size.h) * (vertex_program ? s.super_y : 1.0f);
     c.surf[2] = 1.0f / s.zscale;
     Color(s.rs[kRsFogColor], c.fog_color);
     c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
@@ -2388,7 +2390,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     Alloc dc = Upload(sizeof(DrawConstants), 256);
-    FillSurfaceConstants(s, size, c);
+    FillSurfaceConstants(s, size, sh.prog, c);
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
