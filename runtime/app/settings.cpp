@@ -174,16 +174,30 @@ struct Shape {
 };
 
 // asked per frame, per viewport change and per fold push: the desktop mode lookup only runs when an input changes
+//
+// The key carries the window's real drawable as well as the settings mode. Keyed on the
+// settings alone, a live apply from the F1 panel or a dragged window changed the drawable
+// without changing the key, so the shape - and with it the present aspect and the widening -
+// stayed at its startup value until the game was restarted.
 Shape Shaped() {
     static std::atomic<uint64_t> mode_key{~0ull};
+    static std::atomic<uint64_t> draw_key{~0ull};
     static std::atomic<uint32_t> pick_key{~0u};
     static std::atomic<bool> wide{true};
     static std::atomic<float> widen{1.0f};
     static std::atomic<float> target{16.0f / 9.0f};
     const Settings& s = Get();
     uint64_t mode = uint64_t(s.width) << 32 | s.height;
+#if defined(_WIN32)
+    // Windows has no platform::ClientSize(); its shape follows the settings mode as before.
+    uint64_t draw = mode;
+#else
+    platform::Size drawable = platform::ClientSize();
+    uint64_t draw = uint64_t(drawable.width) << 32 | drawable.height;
+#endif
     uint32_t pick = ChosenAspect() << 1 | uint32_t(s.ultrawide);
     bool changed = mode_key.exchange(mode) != mode;
+    changed |= draw_key.exchange(draw) != draw;
     changed |= pick_key.exchange(pick) != pick;
     if (changed) {
         Mode m = Output();

@@ -2117,8 +2117,15 @@ void VulkanBackend::UploadGammaRamp() {
 // on an output narrower than 3:2, where the title projects 4:3 too.
 //
 // An explicit aspect_ratio still wins, so 4:3 remains available for anyone who
-// wants the pillarboxed console shape. A widened frame target (HostAspect
-// active) never comes here: BlitFrame presents it whole at its own aspect.
+// wants the pillarboxed console shape.
+//
+// auto presents the aspect the guest is ACTUALLY projecting, which is not the
+// same as the window's shape whenever host widening is off. The title projects
+// 16:9 on any output 3:2 or wider (the widescreen bit the host answers), and
+// only the Hor+ path makes it project wider than that. Presenting a 16:9-
+// projected frame at a 21:9 window would stretch it 1.34x - the artifact the
+// Hor+ gate exists to avoid - so with widening off a wider display gets 16:9
+// pillarboxed, and once widening is on it gets the widened aspect and fills.
 float PresentSrcAspect() {
     const std::string& ar = app::Get().aspect_ratio;
     if (ar == "4:3") return 4.0f / 3.0f;
@@ -2126,7 +2133,9 @@ float PresentSrcAspect() {
     if (ar == "16:10") return 16.0f / 10.0f;
     if (ar == "21:9") return 21.0f / 9.0f;
     if (ar == "32:9") return 32.0f / 9.0f;
-    return app::TargetAspect();  // auto: the shape of the output
+    float host = app::HostAspect();
+    if (host > 0.0f) return host;                                  // widened: the frame really is this shape
+    return app::Widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;         // what the title is projecting
 }
 void VulkanBackend::BlitFrame(Target& t, uint32_t w, uint32_t h) {
     // Fit the picture inside the window at its own aspect, centred: black
