@@ -68,7 +68,7 @@ using VkPerfClock = std::chrono::steady_clock;
 double VkPerfMs(VkPerfClock::time_point t) { return std::chrono::duration<double, std::milli>(VkPerfClock::now() - t).count(); }
 struct VkPerf {
     double draw = 0, present = 0, clear = 0, copy = 0;
-    uint64_t draws = 0, skipped = 0, nopipeline = 0, nopipeShader = 0, nopipePso = 0, nopipeSet = 0, verts = 0, raw = 0;
+    uint64_t draws = 0, skipped = 0, nopipeline = 0, nopipeShader = 0, nopipePso = 0, nopipeSet = 0, staleAlloc = 0, verts = 0, raw = 0;
     uint64_t upload = 0, overflow = 0, texups = 0, texupBytes = 0, newtex = 0;
     uint64_t targets = 0, rtups = 0, syncs = 0, shaders = 0, psos = 0, clears = 0, copies = 0;
 };
@@ -309,7 +309,7 @@ private:
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool fencePending = false;
         VkBuffer upload = VK_NULL_HANDLE; VkDeviceMemory uploadMem = VK_NULL_HANDLE; uint8_t* map = nullptr;
-        uint64_t used = 0; VkDescriptorPool pool = VK_NULL_HANDLE; uint32_t sets = 0;
+        uint64_t used = 0; VkDescriptorPool pool = VK_NULL_HANDLE; uint32_t sets = 0; uint64_t gen = 0;
         VkSemaphore imageAvailable = VK_NULL_HANDLE, renderFinished = VK_NULL_HANDLE;
         std::vector<std::function<void()>> garbage;
     };
@@ -332,6 +332,7 @@ private:
     VkRenderPass RenderPassFor(VkFormat color, VkFormat depth, bool hasColor, bool hasDepth);
     Frame& Cur() { return frames_[frame_ % kFrames]; }
     void EnsureRecording();
+    void CheckAllocGeneration(const char* what);
     void EnsureSetRoom();
     void Submit(bool wait, VkSemaphore waitSem = VK_NULL_HANDLE, VkSemaphore signalSem = VK_NULL_HANDLE);
     void WaitFrame(Frame& f);
@@ -419,7 +420,7 @@ private:
     VkCommandPool pool_ = VK_NULL_HANDLE;
     Frame frames_[kFrames];
     uint64_t frame_ = 0, presents_ = 0;
-    bool recording_ = false;
+    bool recording_ = false; uint64_t segmentGen_ = 0;  // bumped every time EnsureRecording opens a segment
     uint64_t submitCounter_ = 0;
     std::unordered_map<uint64_t, VkFence> submitFences_;
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
@@ -626,9 +627,21 @@ void VulkanBackend::EnsureRecording() {
     if (recording_) return;
     Frame& f = Cur();
     if (f.fencePending) WaitFrame(f);
-    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0; f.sets = 0;
+    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0; f.sets = 0; f.gen = ++segmentGen_;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(f.cmd, &bi); recording_ = true;
+}
+// An allocation is only valid in the segment that will record its use: it must be
+// handed out while that segment is open, stamped with its generation. Anything
+// handed out before EnsureRecording opens the segment is reset away by it - the
+// upload ring offset is reused and the descriptor set freed - which is the stale
+// case this counts. Both allocators call EnsureRecording first, so this stays 0;
+// it fires if that ordering is ever broken again.
+void VulkanBackend::CheckAllocGeneration(const char* what) {
+    Frame& f = Cur();
+    if (recording_ && f.gen == segmentGen_) return;
+    g_vkPerf.staleAlloc++;
+    LOG_FIRST(16, "vulkan: stale %s allocation: no open segment (frame gen %llu, segment gen %llu, present %llu)", what, (unsigned long long)f.gen, (unsigned long long)segmentGen_, (unsigned long long)presents_);
 }
 // Outside any render pass, before work that allocates a descriptor set (and before
 // its uploads, since a flush restarts the upload ring as well): a segment that has
@@ -657,7 +670,7 @@ void VulkanBackend::Flush() { Submit(true); }
 VulkanBackend::Alloc VulkanBackend::UploadAlloc(uint64_t size, uint64_t align) {
     // The ring belongs to the open segment: allocating after a submit but before the
     // next segment starts would hand out space that segment's reset then reuses.
-    EnsureRecording();
+    EnsureRecording(); CheckAllocGeneration("upload");
     Frame& f = Cur();
     uint64_t o = (f.used + align - 1) & ~(align - 1);
     if (o + size <= kUploadSize) { f.used = o + size; g_vkPerf.upload += size; return {f.upload, o, f.map + o}; }
@@ -1362,7 +1375,7 @@ bool UnitTexcoordsOf(const Assembled& a) {
 VkDescriptorSet VulkanBackend::AllocDrawSet(VkBuffer vcBuf, uint64_t vcOff, VkBuffer dcBuf, uint64_t dcOff, const DrawTextures& stages, const std::array<VkSampler, 4>& samplers) {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    EnsureRecording();  // as UploadAlloc: the set must come from the open segment's pool
+    EnsureRecording(); CheckAllocGeneration("descriptor set");  // as UploadAlloc: the set must come from the open segment's pool
     ai.descriptorPool = Cur().pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &setLayout_;
     VkResult ar = vkAllocateDescriptorSets(device_, &ai, &set);
     if (ar != VK_SUCCESS) { LOG_FIRST(16, "vulkan: vkAllocateDescriptorSets failed: VkResult %d (%u sets in this segment)", int(ar), Cur().sets); return VK_NULL_HANDLE; }
@@ -1640,7 +1653,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     Assembled& a = asm_;
     if (!Assemble(s, prim, start, count, indices, a)) { g_vkPerf.skipped++; if (count) LOG_FIRST(16, "vulkan: draw skipped, nothing to assemble: rt %08X prim %u count %u", s.rt.data, prim, count); return; }
     g_vkPerf.verts += a.vertex_count; g_vkPerf.raw += a.vertices.empty() ? 1 : 0;
-    if (Cur().used > kUploadSize - kUploadReserve) Submit(true);
+    if (recording_ && Cur().used > kUploadSize - kUploadReserve) Submit(true);  // Cur().used is only meaningful in the open segment
     if (!BindTargets(s)) { g_vkPerf.skipped++; return; }
     DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog && !s.vs->hash) s.vs->hash = Hash(s.vs->program.data(), s.vs->program.size() * 4) | 1;
@@ -1963,9 +1976,9 @@ void VulkanBackend::LogPerf() {
          g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_hle_ns.exchange(0) / n / 1e6,
          g_perf_sendstate_ns.exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
          g_perf_sync_late.exchange(0) / n);
-    LOGI("perf: per frame %.0f draws (%.0f raw) %.0f skipped %.0f nopipeline (shader %.0f pso %.0f set %.0f) %.0fk verts %.1f MB upload %.1f overflow | "
+    LOGI("perf: per frame %.0f draws (%.0f raw) %.0f skipped %.0f nopipeline (shader %.0f pso %.0f set %.0f) stalealloc %llu %.0fk verts %.1f MB upload %.1f overflow | "
          "%.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f read-backs | %llu shaders %llu psos this second | %.0f clears %.0f copies per frame",
-         p.draws / n, p.raw / n, p.skipped / n, p.nopipeline / n, p.nopipeShader / n, p.nopipePso / n, p.nopipeSet / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n,
+         p.draws / n, p.raw / n, p.skipped / n, p.nopipeline / n, p.nopipeShader / n, p.nopipePso / n, p.nopipeSet / n, (unsigned long long)p.staleAlloc, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n,
          p.texups / n, p.texupBytes / n / 1048576.0, p.newtex / n, p.targets / n, p.rtups / n, p.syncs / n,
          (unsigned long long)p.shaders, (unsigned long long)p.psos, p.clears / n, p.copies / n);
     g_vkPerf = VkPerf{};
@@ -1980,15 +1993,7 @@ void VulkanBackend::PeriodicCapture(Target* front) {
     std::filesystem::path dir = std::filesystem::weakly_canonical(app::ExeDir() / diag::CaptureDir(), ec);
     std::filesystem::create_directories(dir, ec);
     char name[64]; std::snprintf(name, sizeof(name), "front_%05llu.bmp", (unsigned long long)presents_);
-    LOGI("vulkan: capture probe: present %llu image %p view %p tracked layout %d before first sample", (unsigned long long)presents_, (void*)front->res.image, (void*)front->res.view, int(front->res.layout));
     CapSaveColorAs(*front, dir / name);
-    {   // second sample of the same target in the same Present, after the first
-        // sample's read-back flushed the command buffer (which also resets the
-        // frame's descriptor pool): the pair is the D2 before/after instrument
-        char bname[64]; std::snprintf(bname, sizeof(bname), "front_%05llu_b.bmp", (unsigned long long)presents_);
-        CapSaveColorAs(*front, dir / bname);
-        LOGI("vulkan: capture probe: second sample done, tracked layout now %d", int(front->res.layout));
-    }
     {   // the host-resolution target as well: the guest dump above shrinks the
         // (possibly widened) target to guest size and hides the widening geometry
         std::vector<uint8_t> px;
@@ -2057,8 +2062,8 @@ void VulkanBackend::Present(const Surface& front) {
         float v0 = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_top) / float(guestH_) : 0.0f;
         float dv = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_height) / float(guestH_) : 1.0f;
         float sx = 0, sy = v0 * float(t->h), sw = float(t->w), sh = dv * float(t->h);
-        LOGI("vulkan: present %llu image %u front %08X guest %ux%u target %ux%u scale %.3f widen %.3f targetAspect %.3f srcAspect %.3f window %ux%u srcPx (%.0f,%.0f %.0fx%.0f) srcUv (0,%.3f)-(1,%.3f) dst (%.0f,%.0f %.0fx%.0f) gamma=%d vkimage %p view %p sampleview %p layout %d",
-             (unsigned long long)presents_, imageIndex, t->data, t->gw, t->gh, t->w, t->h, scale_, widen_, app::TargetAspect(), aspect, bbW_, bbH_, sx, sy, sw, sh, v0, dv, (float(bbW_) - vw) / 2, (float(bbH_) - vh) / 2, vw, vh, int(gamma_), (void*)t->res.image, (void*)t->res.view, (void*)t->res.SampleView(), int(t->res.layout));
+        LOGI("vulkan: present %llu image %u front %08X guest %ux%u target %ux%u scale %.3f widen %.3f targetAspect %.3f srcAspect %.3f window %ux%u srcPx (%.0f,%.0f %.0fx%.0f) srcUv (0,%.3f)-(1,%.3f) dst (%.0f,%.0f %.0fx%.0f) gamma=%d",
+             (unsigned long long)presents_, imageIndex, t->data, t->gw, t->gh, t->w, t->h, scale_, widen_, app::TargetAspect(), aspect, bbW_, bbH_, sx, sy, sw, sh, v0, dv, (float(bbW_) - vw) / 2, (float(bbH_) - vh) / 2, vw, vh, int(gamma_));
     }
     presents_++; presentsSeen_.store(presents_); frame_++;
     ReleaseOldTextures();
