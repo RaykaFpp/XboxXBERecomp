@@ -120,11 +120,14 @@ void ApplyNow() {
     Mode out = Output();
     platform::Size desk = platform::DesktopSize();
     bool hidden = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN) != 0;
+    const char* mode_name = s.display_mode == DisplayMode::Fullscreen ? "fullscreen"
+                            : s.display_mode == DisplayMode::Borderless ? "borderless" : "windowed";
+    bool mode_set = true;
     if (s.display_mode == DisplayMode::Fullscreen) {
         SDL_DisplayMode mode{};
         mode.w = int(s.width ? s.width : desk.width);
         mode.h = int(s.height ? s.height : desk.height);
-        SDL_SetWindowFullscreenMode(g_window, (s.width && s.height) ? &mode : nullptr);
+        mode_set = SDL_SetWindowFullscreenMode(g_window, (s.width && s.height) ? &mode : nullptr);
         SDL_SetWindowFullscreen(g_window, true);
     } else if (s.display_mode == DisplayMode::Borderless) {
         SDL_SetWindowFullscreen(g_window, false);
@@ -145,6 +148,13 @@ void ApplyNow() {
     }
     if (hidden) SDL_HideWindow(g_window);
     CacheClientSize();
+    // What was asked for, and what the window reports right after asking. On Wayland a
+    // size change lands through the compositor's configure, so the drawable here can
+    // still be the old size: the SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED log below and the
+    // backend's "swapchain %ux%u (window drawable ...)" line are the settled answer.
+    LOGI("display: %s, settings %ux%u, output %ux%u, fullscreen mode set %d, window drawable now %ux%u",
+         mode_name, s.width, s.height, out.width, out.height, int(mode_set),
+         g_client_w.load(std::memory_order_relaxed), g_client_h.load(std::memory_order_relaxed));
 }
 
 struct OpenRequest {
@@ -212,8 +222,13 @@ bool HandleEvent(const SDL_Event& e) {  // window thread; true: quit
     // recreates the swapchain at the new size - on Wayland the swapchain
     // extent is the window size, so this event is what drives fullscreen.
     if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_WINDOW_RESIZED ||
-        e.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED)
+        e.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) {
+        uint32_t was_w = g_client_w.load(std::memory_order_relaxed), was_h = g_client_h.load(std::memory_order_relaxed);
         CacheClientSize();
+        if (g_client_w.load(std::memory_order_relaxed) != was_w || g_client_h.load(std::memory_order_relaxed) != was_h)
+            LOGI("display: window drawable now %ux%u", g_client_w.load(std::memory_order_relaxed),
+                 g_client_h.load(std::memory_order_relaxed));
+    }
     if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED) g_focus = true;
     if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) g_focus = false;
     if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
