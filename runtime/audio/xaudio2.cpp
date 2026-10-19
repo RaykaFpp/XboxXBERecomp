@@ -56,18 +56,6 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;
         std::vector<float> bufs(kSlots * kFrames * 2);
-        // Temporary proof capture (SIMS2_AUDIO_WAV=<path>): first seconds of the mixed
-        // output as 16-bit PCM, so non-silence is demonstrable without ears on the box.
-        FILE* wav = nullptr;
-        uint32_t wav_left = 0;
-        if (const char* p = std::getenv("SIMS2_AUDIO_WAV"); p && p[0]) {
-            wav = std::fopen(p, "wb");
-            if (wav) {
-                wav_left = kRate * 20;  // 20 s
-                uint8_t hdr[44] = {};
-                std::fwrite(hdr, 1, 44, wav);
-            }
-        }
         for (uint32_t n = 0;;) {
             XAUDIO2_VOICE_STATE st;
             voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
@@ -82,26 +70,6 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             for (uint32_t i = 0; i < kFrames * 2; i++) peak = std::max(peak, std::fabs(b[i]));
             float prev = g_peak.load(std::memory_order_relaxed);
             while (peak > prev && !g_peak.compare_exchange_weak(prev, peak, std::memory_order_relaxed)) {
-            }
-            if (wav && wav_left) {
-                uint32_t take = std::min(wav_left, kFrames);
-                for (uint32_t i = 0; i < take * 2; i++) {
-                    int16_t s = int16_t(std::clamp(b[i], -1.0f, 1.0f) * 32767.0f);
-                    std::fwrite(&s, 2, 1, wav);
-                }
-                wav_left -= take;
-                if (!wav_left) {
-                    uint32_t data = kRate * 20 * 4, riff = data + 36;
-                    std::fseek(wav, 0, SEEK_SET);
-                    auto w32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, wav); };
-                    auto w16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, wav); };
-                    std::fwrite("RIFF", 1, 4, wav); w32(riff); std::fwrite("WAVEfmt ", 1, 8, wav);
-                    w32(16); w16(1); w16(2); w32(kRate); w32(kRate * 4); w16(4); w16(16);
-                    std::fwrite("data", 1, 4, wav); w32(data);
-                    std::fclose(wav);
-                    wav = nullptr;
-                    LOGI("audio: wav capture complete");
-                }
             }
             XAUDIO2_BUFFER xb{};
             xb.AudioBytes = kFrames * 8;
