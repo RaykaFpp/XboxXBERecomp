@@ -20,6 +20,7 @@ struct SDL_Window;
 
 namespace app::platform {
 
+
 // The native window handle: HWND on Windows, SDL_Window* on Linux. This is
 // the same pointer app::Window() returns, typed for platform code.
 using NativeWindow = void*;
@@ -72,3 +73,12 @@ struct HdrInfo {
 HdrInfo QueryHdr();
 
 }  // namespace app::platform
+
+namespace app {
+// The aspect the host renders and presents the frame at when host Hor+ widening
+// is active: the chosen aspect, or the output's own, when `ultrawide` is on and
+// that aspect is wider than 16:9. Zero when widening is off (ultrawide off, or an
+// aspect no wider than 16:9 - 16:9 itself is the title's own anamorphic
+// widescreen, presented as authored, never widened). Defined in settings.cpp.
+float HostAspect();
+}  // namespace app

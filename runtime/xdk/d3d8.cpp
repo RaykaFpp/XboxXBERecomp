@@ -11,6 +11,9 @@
 #include <unordered_set>
 
 #include "app/app.h"
+#if !defined(_WIN32)
+#include "app/platform.h"  // app::HostAspect (Linux Hor+ widening)
+#endif
 #include "core/diag.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
@@ -219,20 +222,57 @@ float ZScale(const gpu::Surface& zs) {
     return f == 0x2C || f == 0x30 ? 65535.0f : 16777215.0f;
 }
 
-// The main frame is drawn wider than the console's so an ultrawide display shows more world. The transform to
-// console pixels is a scale and an offset: the scale stays, so the picture keeps its pixels per degree and its
-// vertical field of view, and the offset moves to the widened frame's centre. Hor+, no stretch. Only the main
+// The widened frame's guest width at app::HostAspect(), 0 when host widening is
+// off. Linux only: the frame target is built this wide (gpu/vulkan.cpp
+// WidenedGuestWidth, the same formula), and everything below centres on it.
+// Windows keeps its AspectWiden-based width in its own backend and its own
+// numbers below, unchanged.
+uint32_t WidenedFrameWidth() {
+#if defined(_WIN32)
+    return 0;
+#else
+    float aspect = app::HostAspect();
+    if (aspect <= 0.0f) return 0;
+    return std::max(g_frame_w, uint32_t(std::lround(float(g_frame_h) * aspect)));
+#endif
+}
+
+// The main frame is drawn wider than the console's so an ultrawide display shows more world. Only the main
 // frame grows, so a pass drawn into an off-screen surface of another size keeps its own centre and its own
-// numbers. Zero on 16:9, with ultrawide off, or when the backend draws the console's width
-// (gpu::Backend::WidensFrame), and then nothing below it runs. In render target pixels: a supersampled back
-// buffer has SuperSampleScale of them to each pixel of the frame.
+// numbers. The centre moves to the widened frame's centre (this shift, in render target pixels: a supersampled
+// back buffer has SuperSampleScale of them to each pixel of the frame), the 3-D fold's horizontal scale grows
+// with the frame (FrameFoldScale), and the 2-D screen matrix keeps its authored scale so menus and HUD keep
+// their size and only move to the new centre. Hor+, no stretch, vertical field of view untouched. Zero on
+// 16:9, with ultrawide off, or when the backend draws the console's width (gpu::Backend::WidensFrame), and
+// then nothing below it runs.
 float FrameCentreShift() {
+#if defined(_WIN32)
     if (!g_frame_widened) return 0;
     float dx = float(std::lround(g_frame_w * app::AspectWiden()) - long(g_frame_w)) * 0.5f;
+#else
+    uint32_t wide_w = WidenedFrameWidth();
+    if (!wide_w) return 0;
+    float dx = (float(wide_w) - float(g_frame_w)) * 0.5f;
+#endif
     if (dx == 0) return 0;
     uint32_t w = 0, h = 0;
     gpu::SurfaceSize(g_state.rt.header ? g_state.rt : g_state.zs, w, h);
     return w == g_frame_w && h == g_frame_h ? dx * g_state.super_x : 0;
+}
+
+// How much wider the widened frame is than the console's, for the 3-D fold's
+// horizontal scale: the fold maps post-projection NDC to frame pixels, so its
+// scale grows with the frame or the widened world would squeeze back into the
+// console's columns. 1 when widening is off or the current target is not the
+// frame (an off-screen pass keeps its own fold, scale 1 offset 0 included).
+float FrameFoldScale() {
+#if defined(_WIN32)
+    return 1.0f;
+#else
+    uint32_t wide_w = WidenedFrameWidth();
+    if (!wide_w || FrameCentreShift() == 0) return 1.0f;
+    return float(wide_w) / float(g_frame_w);
+#endif
 }
 
 // D3DMULTISAMPLE_TYPE: x samples in bits 4 to 7, y in bits 0 to 3, 0x1000 a multisampling type, 0x2000 a supersampling
@@ -277,11 +317,22 @@ constexpr uint32_t kVscCount = 192;
 //    no program reads that as a position transform, so it is left alone.
 // Of the six programs captured, three read the fold and three read the screen matrix and none read both, so a
 // draw is shifted once or not at all.
+constexpr uint32_t kVscFoldScale = 97;   // the engine's viewport scale, horizontal in .x
 constexpr uint32_t kVscFoldOffset = 98;  // the engine's viewport offset, horizontal in .x
 constexpr uint32_t kVscScreen = 121;     // the 2D unit to pixel matrix, horizontal in .w
 
-// a constant has just been stored: centre it when it is the horizontal translation into console pixels
+// a constant has just been stored: centre it when it is the horizontal translation into console pixels,
+// and widen the 3-D fold's horizontal scale onto the widened frame (FrameFoldScale). This is the one
+// place both moves happen: every push-buffer reader and every SetVertexShaderConstant path stores
+// through here, so world draws (fold) and 2-D draws (screen matrix) cannot drift apart.
 void CentreVsConstant(uint32_t r) {
+    if (r == kVscFoldScale) {
+        float f = FrameFoldScale();
+        if (f == 1.0f) return;
+        const float& x = g_state.vsc[r][0];
+        Set(x, x * f);
+        return;
+    }
     if (r != kVscFoldOffset && r != kVscScreen) return;
     float dx = FrameCentreShift();
     if (dx == 0) return;
@@ -312,7 +363,7 @@ void UpdateViewportConstants() {
     Set(g_state.zscale, ZScale(g_state.zs));
     float hw = v.w * 0.5f, hh = v.h * 0.5f, sx = g_state.super_x, sy = g_state.super_y;
     if (!g_own_constants) {
-        Set(g_state.vsc[58], {hw * sx, -hh * sy, (v.max_z - v.min_z) * g_state.zscale, 0});
+        Set(g_state.vsc[58], {hw * sx * FrameFoldScale(), -hh * sy, (v.max_z - v.min_z) * g_state.zscale, 0});
         Set(g_state.vsc[59], {v.x * sx + g_state.ss_offset_x + hw * sx + FrameCentreShift(),
                               v.y * sy + g_state.ss_offset_y + hh * sy, v.min_z * g_state.zscale, 0});
     }

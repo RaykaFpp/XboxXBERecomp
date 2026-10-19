@@ -304,7 +304,7 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
-    bool WidensFrame() const override { return false; }
+    bool WidensFrame() const override { return app::HostAspect() > 0.0f; }
 private:
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool fencePending = false;
@@ -478,7 +478,7 @@ private:
     Target* drawRt_ = nullptr;
     Target* drawDs_ = nullptr;
     uint32_t guestW_ = 640, guestH_ = 480, bbW_ = 0, bbH_ = 0;
-    float scale_ = 1.0f, widen_ = 1.0f;
+    float scale_ = 1.0f, widen_ = 1.0f, hostAspect_ = 0.0f;
     ImageRes lut_;
     uint8_t ramp_[768] = {};
     bool rampDirty_ = false, gamma_ = false;
@@ -871,7 +871,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     lut_ = CreateImage(256, 1, kBgra, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
     for (int i = 0; i < 256; i++) ramp_[i] = ramp_[256 + i] = ramp_[512 + i] = uint8_t(i);
     rampDirty_ = true;
-    scale_ = app::RenderScale(guestH_); widen_ = app::AspectWiden();
+    scale_ = app::RenderScale(guestH_); widen_ = app::AspectWiden(); hostAspect_ = app::HostAspect();
     {
         VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(physical_, &props);
         char key[192];
@@ -1037,13 +1037,19 @@ void VulkanBackend::ResizeSwapIfNeeded(bool force) {
     g_handles.imageCount = uint32_t(swapImages_.size()); g_handles.minImageCount = std::max<uint32_t>(uint32_t(swapImages_.size()), 2);
 }
 // ---- targets ----
-// Hor+ ultrawide widening is not implemented on this backend: the frame
-// target is exactly the guest's size at render scale (dx == 0), and
-// widen_/app::AspectWiden() is read for logging only. WidensFrame() says so
-// to the XDK layer, which then leaves the title's horizontal centre where the
-// console has it; while it moved it for a widening this target never had,
-// every 2-D draw and the world landed (widened - 640) / 2 guest pixels right.
-uint32_t VulkanBackend::WidenedGuestWidth() const { return guestW_; }
+// Hor+ ultrawide widening: at app::HostAspect() (wider than 16:9, ultrawide on)
+// the frame target is built wider than the guest's buffer by that aspect at the
+// same height, so the guest's projection (overridden to the same aspect in
+// src/game/hooks.cpp) shows more world at the sides at an unchanged vertical
+// field of view. The gained columns sit half on each side (Target::dx); the
+// XDK layer centres both the 3-D fold and the 2-D screen matrix by the same dx
+// (sdk/runtime/xdk/d3d8.cpp FrameCentreShift), and BlitFrame presents the
+// widened target whole. Off (aspect 0) every number here is the console's.
+uint32_t VulkanBackend::WidenedGuestWidth() const {
+    float aspect = app::HostAspect();
+    if (aspect <= 0.0f) return guestW_;
+    return std::max(guestW_, uint32_t(std::lround(float(guestH_) * aspect)));
+}
 GuestExtent VulkanBackend::BoundExtent(const Surface& s) const {
     GuestExtent e{}; SurfaceSize(s, e.w, e.h);
     const Target* t = boundRt_ ? boundRt_ : boundDs_;
@@ -1445,7 +1451,7 @@ void VulkanBackend::FillConstants(const State& s, const DrawShaders& sh, const D
         MatMulC(s.transforms[kTsWorld].data(), s.transforms[kTsView].data(), wv);
         MatMulC(wv, s.transforms[kTsProj].data(), wvp);
         const auto& v = s.viewport;
-        float sx = float(v.w) / size.w, sy = float(v.h) / size.h;
+        float sx = float(v.w + size.dx * 2) / size.w, sy = float(v.h) / size.h;
         float ox = (2.0f * (v.x + size.dx) + v.w) / size.w - 1, oy = 1 - (2.0f * v.y + v.h) / size.h;
         float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, v.max_z - v.min_z, 0, ox, oy, v.min_z, 1};
         MatMulC(wvp, vpm, full); TransposeC(full, c.wvp); TransposeC(wv, c.wv);
@@ -1897,7 +1903,18 @@ void VulkanBackend::UploadTarget(Target& t, const Surface& s) {
     } else DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, px, pitch);
     ImageRes tex = CreatePixelImage(px, pitch, d.width, d.height);
     if (!tex.Valid()) return;
-    float uv[4] = {0, 0, 1, 1}; BlitInto(t, tex, uv, false, true, 1, 1.0f, over); DeferDestroyImage(tex);
+    float uv[4] = {0, 0, 1, 1};
+    if (t.dx != 0) {
+        // Guest pixels are the console's width: they land in the widened
+        // target's central columns, not stretched across the whole target.
+        float sc = float(t.w) / (float(t.gw) + t.dx * 2);
+        std::array<float, 4> vp{t.dx * sc, 0, float(t.gw) * sc, float(t.h)};
+        PrepareBlitSource(tex, false);
+        VkFramebuffer fb; BeginTargetPass(&t, nullptr, fb);
+        BlitToImage(kBgra, t.w, t.h, tex, uv, false, true, 1, 1.0f, over, &vp);
+        EndPass(); t.drawn = true; boundRt_ = boundDs_ = nullptr;
+    } else BlitInto(t, tex, uv, false, true, 1, 1.0f, over);
+    DeferDestroyImage(tex);
     t.epoch = DirtyEpoch(t.data); t.sig = MemSig(t.data, t.bytes);
 }
 void VulkanBackend::PrepareBlitSource(ImageRes& src, bool gamma) {
@@ -1973,6 +1990,22 @@ bool VulkanBackend::ReadBackImage(ImageRes& src, uint32_t w, uint32_t h, std::ve
     vkUnmapMemory(device_, mem); vkDestroyBuffer(device_, buf, nullptr); vkFreeMemory(device_, mem, nullptr); return true;
 }
 ImageRes VulkanBackend::PrepareCopySource(Target& t, ImageRes* reuseDown) {
+    if (t.dx != 0) {
+        // A widened frame target holds more world at the sides; guest memory is
+        // still the console's width, so a read-back (Sync, captures) delivers the
+        // central guest columns, never the squeezed widened picture.
+        ImageRes down;
+        if (reuseDown && reuseDown->Valid() && reuseDown->w == t.gw && reuseDown->h == t.gh) down = *reuseDown;
+        else {
+            down = CreateImage(t.gw, t.gh, kBgra, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (!down.Valid()) return down;
+        }
+        Target tmp; tmp.res = down; tmp.w = down.w; tmp.h = down.h; tmp.gw = t.gw; tmp.gh = t.gh;
+        float wide = float(t.gw) + t.dx * 2;
+        float uv[4] = {t.dx / wide, 0, float(t.gw) / wide, 1};
+        BlitInto(tmp, t.res, uv, false, true, 1, 1.0f, false);
+        down = tmp.res; if (reuseDown) *reuseDown = down; return down;
+    }
     if (t.w != t.gw || t.h != t.gh) return ShrinkImage(t.res, t.gw, t.gh, 1, 1.0f, reuseDown);
     return t.res;
 }
@@ -1993,7 +2026,9 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
     if (!dstT || srcT == dstT) return;
     if (cap_) std::fprintf(cap_, "%04u copy %08X to %08X\n", capI_++, src.data, dst.data);
     bool listed = count && srcRects; uint32_t n = listed ? count : 1;
-    float srcScale = float(srcT->w) / srcT->gw, dstScale = float(dstT->w) / dstT->gw;
+    // Host pixels per guest pixel across the whole (possibly widened) target;
+    // a guest x lands at (x + dx) * scale inside a widened frame target.
+    float srcScale = float(srcT->w) / (float(srcT->gw) + srcT->dx * 2), dstScale = float(dstT->w) / (float(dstT->gw) + dstT->dx * 2);
     if (srcT->w == dstT->w && srcT->h == dstT->h) {
         Transition(srcT->res, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); Transition(dstT->res, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         for (uint32_t i = 0; i < n; i++) {
@@ -2003,9 +2038,9 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
             region.extent = {std::min(srcT->w, dstT->w), std::min(srcT->h, dstT->h), 1};
             if (listed) {
                 GuestRectI r = ReadGuestRect(srcRects, i);
-                region.srcOffset = {int32_t(uint32_t(r.left) * srcScale), int32_t(uint32_t(r.top) * srcScale), 0};
-                region.dstOffset = {int32_t(uint32_t(r.left) * dstScale), int32_t(uint32_t(r.top) * dstScale), 0};
-                if (dstPoints) { GuestPointI p = ReadGuestPoint(dstPoints, i); region.dstOffset = {int32_t(uint32_t(p.x) * dstScale), int32_t(uint32_t(p.y) * dstScale), 0}; }
+                region.srcOffset = {int32_t((r.left + srcT->dx) * srcScale), int32_t(uint32_t(r.top) * srcScale), 0};
+                region.dstOffset = {int32_t((r.left + dstT->dx) * dstScale), int32_t(uint32_t(r.top) * dstScale), 0};
+                if (dstPoints) { GuestPointI p = ReadGuestPoint(dstPoints, i); region.dstOffset = {int32_t((p.x + dstT->dx) * dstScale), int32_t(uint32_t(p.y) * dstScale), 0}; }
                 region.extent.width = std::min(uint32_t(std::max<int32_t>(0, r.right - r.left)) * uint32_t(srcScale), srcT->w);
                 region.extent.height = std::min(uint32_t(std::max<int32_t>(0, r.bottom - r.top)) * uint32_t(srcScale), srcT->h);
                 if (!region.extent.width || !region.extent.height) continue;
@@ -2021,8 +2056,9 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
             float x0 = 0, y0 = 0, x1 = float(std::min(srcT->gw, dstT->gw)), y1 = float(std::min(srcT->gh, dstT->gh)), dx = 0, dy = 0;
             if (listed) { GuestRectI r = ReadGuestRect(srcRects, i); x0 = float(r.left); y0 = float(r.top); x1 = float(r.right); y1 = float(r.bottom); dx = x0; dy = y0; if (dstPoints) { GuestPointI p = ReadGuestPoint(dstPoints, i); dx = float(p.x); dy = float(p.y); } }
             if (x1 <= x0 || y1 <= y0) continue;
-            float uv[4] = {x0 / srcT->gw, y0 / srcT->gh, (x1 - x0) / srcT->gw, (y1 - y0) / srcT->gh};
-            std::array<float, 4> vp{dx * dstScale, dy * dstScale, (x1 - x0) * dstScale, (y1 - y0) * dstScale};
+            float srcWide = float(srcT->gw) + srcT->dx * 2;
+            float uv[4] = {(x0 + srcT->dx) / srcWide, y0 / srcT->gh, (x1 - x0) / srcWide, (y1 - y0) / srcT->gh};
+            std::array<float, 4> vp{(dx + dstT->dx) * dstScale, dy * dstScale, (x1 - x0) * dstScale, (y1 - y0) * dstScale};
             PrepareBlitSource(srcT->res, false);
             VkFramebuffer fb; BeginTargetPass(dstT, nullptr, fb);
             BlitToImage(kBgra, dstT->w, dstT->h, srcT->res, uv, false, true, uint32_t(std::ceil(std::max(srcScale / dstScale, 1.0f) - 1e-3f)), 1.0f, false, &vp);
@@ -2068,23 +2104,37 @@ void VulkanBackend::UploadGammaRamp() {
     vkCmdCopyBufferToImage(Cmd(), a.buffer, lut_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Transition(lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
-// The aspect the title's picture is shown at: the chosen aspect_ratio, or
-// 4:3 for auto - a 640x448 picture on a 4:3 TV is this title's own shape,
-// not the window's. (app::TargetAspect() is the widened 16:9 of the Hor+
-// path this backend does not implement yet; see WidenedGuestWidth.)
+// The aspect an unwidened title picture is shown at.
+//
+// "auto" is the output's own aspect, not 4:3. The title is already projecting
+// widescreen whenever the host answers ExQueryNonVolatileSetting index 8 with
+// the widescreen bit (kernel/xboxkrnl.cpp, VideoFlags() when app::Widescreen()),
+// which is any output 3:2 or wider - so a 640x448 buffer on a 16:9 window holds
+// a 16:9 picture and presenting it at 4:3 was pillarboxing a picture that
+// already filled the frame. app::TargetAspect() is the same signal the widescreen
+// flag is derived from, so present and projection read one source and cannot
+// drift: 16:9 on a 1920x1080 window, the display's aspect on an ultrawide, 4:3
+// on an output narrower than 3:2, where the title projects 4:3 too.
+//
+// An explicit aspect_ratio still wins, so 4:3 remains available for anyone who
+// wants the pillarboxed console shape. A widened frame target (HostAspect
+// active) never comes here: BlitFrame presents it whole at its own aspect.
 float PresentSrcAspect() {
     const std::string& ar = app::Get().aspect_ratio;
+    if (ar == "4:3") return 4.0f / 3.0f;
     if (ar == "16:9") return 16.0f / 9.0f;
     if (ar == "16:10") return 16.0f / 10.0f;
     if (ar == "21:9") return 21.0f / 9.0f;
     if (ar == "32:9") return 32.0f / 9.0f;
-    return 4.0f / 3.0f;  // "4:3", and auto
+    return app::TargetAspect();  // auto: the shape of the output
 }
 void VulkanBackend::BlitFrame(Target& t, uint32_t w, uint32_t h) {
     // Fit the picture inside the window at its own aspect, centred: black
     // bars wherever the window is a different shape, never a crop and never
-    // a stretch to the window's aspect.
-    float srcAspect = PresentSrcAspect(); float fw = float(w), fh = float(h);
+    // a stretch to the window's aspect. A widened frame target (dx != 0) is
+    // presented whole at its own widened aspect; anything else at the chosen
+    // aspect the title authored (PresentSrcAspect).
+    float srcAspect = t.dx != 0 ? (float(t.gw) + t.dx * 2) / float(t.gh) : PresentSrcAspect(); float fw = float(w), fh = float(h);
     float vh = std::min(fh, fw / srcAspect), vw = vh * srcAspect;
     float v0 = 0, dv = 1;
     if (app::kGame.picture_height && guestH_) { v0 = float(app::kGame.picture_top) / float(guestH_); dv = float(app::kGame.picture_height) / float(guestH_); }
@@ -2232,7 +2282,7 @@ void VulkanBackend::Present(const Surface& front) {
     }
     if (swapStale_) { swapStale_ = false; ResizeSwapIfNeeded(true); }
     if (diag::Perf() && t && presents_ % 60 == 0) {
-        float aspect = PresentSrcAspect(); float vh = std::min(float(bbH_), float(bbW_) / aspect), vw = vh * aspect;
+        float aspect = t->dx != 0 ? (float(t->gw) + t->dx * 2) / float(t->gh) : PresentSrcAspect(); float vh = std::min(float(bbH_), float(bbW_) / aspect), vw = vh * aspect;
         float v0 = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_top) / float(guestH_) : 0.0f;
         float dv = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_height) / float(guestH_) : 1.0f;
         float sx = 0, sy = v0 * float(t->h), sw = float(t->w), sh = dv * float(t->h);
@@ -2266,11 +2316,11 @@ void VulkanBackend::CountFps() {
     if (el >= 0.5) { fps_ = fpsN_ / el; fpsN_ = 0; fpsT_ = now; }
 }
 void VulkanBackend::ApplySettings() {
-    float want = app::RenderScale(guestH_); float wide = app::AspectWiden();
-    if (std::fabs(want - scale_) > 1e-4f || std::fabs(wide - widen_) > 1e-4f) {
+    float want = app::RenderScale(guestH_); float wide = app::AspectWiden(); float aspect = app::HostAspect();
+    if (std::fabs(want - scale_) > 1e-4f || std::fabs(wide - widen_) > 1e-4f || std::fabs(aspect - hostAspect_) > 1e-4f) {
         Flush();
         for (auto& [key, tg] : targets_) { DeferDestroyImage(tg.res); DeferDestroyImage(tg.fb); }
-        targets_.clear(); scale_ = want; widen_ = wide; boundRt_ = boundDs_ = nullptr;
+        targets_.clear(); scale_ = want; widen_ = wide; hostAspect_ = aspect; boundRt_ = boundDs_ = nullptr;
     }
 }
 void VulkanBackend::CapSaveColorAs(Target& t, const std::filesystem::path& file) {

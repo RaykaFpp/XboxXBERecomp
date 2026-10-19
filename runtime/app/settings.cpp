@@ -208,6 +208,30 @@ float AspectWiden() { return Shaped().widen; }
 
 float TargetAspect() { return Shaped().target; }
 
+float HostAspect() {
+    // Host Hor+ widening (the Vulkan frame target, the XDK centre shift and the
+    // guest projection override) engages only past 16:9: at 16:9 the title is
+    // already projecting its own anamorphic widescreen into the same buffer, so
+    // presenting that buffer at 16:9 is the faithful picture and widening the
+    // target would only re-derive it. Wider aspects have no title mode, so the
+    // host widens for real: target, projection and present all at this aspect.
+    //
+    // OFF unless SIMSBO_HORPLUS is set. The widening is written but has never
+    // been proven in a loaded lot, and a partial one has twice shipped a broken
+    // picture (the HUD off-centre, the world squeezed back into a 4:3 box). It
+    // stays opt-in until a household screenshot shows: no bars, the HUD the same
+    // size as with it off, and more world at the sides at an unchanged height.
+    // Without it a wider-than-16:9 display gets the title's own 16:9 picture
+    // pillarboxed, which is correct, just not yet generous.
+    static const bool enabled = [] {
+        const char* v = std::getenv("SIMSBO_HORPLUS");
+        return v && v[0] && std::strcmp(v, "0") != 0;
+    }();
+    if (!enabled || !Get().ultrawide) return 0.0f;
+    float target = TargetAspect();
+    return target > 16.0f / 9.0f + 1e-4f ? target : 0.0f;
+}
+
 float RenderScale(uint32_t guest_height) {
     float h = Output().height * (Get().render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
