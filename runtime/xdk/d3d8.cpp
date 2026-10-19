@@ -240,7 +240,9 @@ float FrameCentreShift() {
 // BackBufferScale, and its render target setup (0x24AAC0) takes SuperSampleScale from it, halved by the
 // D3DRS_MULTISAMPLEMODE a multisampling type starts with: so a supersampled back buffer has x by y render target pixels
 // to each of the frame's (this title asks for 0x2222, D3DMULTISAMPLE_4_SAMPLES_SUPERSAMPLE_GAUSSIAN, and doubles its own
-// vertex program positions to match), while NONE (0x11) and the multisampling types keep the frame's.
+// vertex program positions to match), and NONE (0x11) keeps the frame's. Every multisampling type is left at 1 here,
+// which is the library's own value for the 2x1 and 2x2 ones; for 3x3 (0x1233) it gives 1.5, and the whole
+// BackBufferScale to a title that sets D3DRS_MULTISAMPLEMODE to 0. Neither is modelled.
 uint32_t g_super_x = 1, g_super_y = 1;  // the presentation's, on its back buffers
 
 void SetMultiSampleType(uint32_t type) {
