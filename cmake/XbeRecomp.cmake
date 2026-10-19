@@ -14,10 +14,10 @@ file(WRITE ${CMAKE_BINARY_DIR}/sdk_dir.txt "${XBE_SDK_DIR_NATIVE}\n")
 # the log's verbose mode keys off it (core/log.cpp), and dropping to the release log format is a
 # separate decision from optimising.
 foreach(cfg RELEASE RELWITHDEBINFO)
-    if(NOT CMAKE_C_FLAGS_${cfg} MATCHES "-O")
+    if(NOT CMAKE_C_FLAGS_${cfg} MATCHES "[-/]O")
         set(CMAKE_C_FLAGS_${cfg} "${CMAKE_C_FLAGS_${cfg}} -O2" CACHE STRING "" FORCE)
     endif()
-    if(NOT CMAKE_CXX_FLAGS_${cfg} MATCHES "-O")
+    if(NOT CMAKE_CXX_FLAGS_${cfg} MATCHES "[-/]O")
         set(CMAKE_CXX_FLAGS_${cfg} "${CMAKE_CXX_FLAGS_${cfg}} -O2" CACHE STRING "" FORCE)
     endif()
 endforeach()
@@ -40,8 +40,26 @@ set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
-FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+if(CMAKE_CROSSCOMPILING)
+    # Zydis is only for the tools, which a cross build takes from the build machine (below)
+    FetchContent_MakeAvailable(tomlplusplus imgui SDL3)
+else()
+    FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
+endif()
 
+if(CMAKE_CROSSCOMPILING)
+# xbe_recomp runs during the build, so a cross build takes it from a build of cmake/XbeTools.cmake
+# for this (the build) machine instead of building it for the target. xbe_symbols is only run by hand.
+set(XBE_HOST_TOOLS_DIR "" CACHE PATH "build directory of cmake/XbeTools.cmake for the build machine (xbe_recomp)")
+set(XBE_RECOMP_HOST ${XBE_HOST_TOOLS_DIR}/xbe_recomp${CMAKE_HOST_EXECUTABLE_SUFFIX})
+if(NOT XBE_HOST_TOOLS_DIR OR NOT EXISTS ${XBE_RECOMP_HOST})
+    message(FATAL_ERROR "cross-compiling runs xbe_recomp on this machine, and XBE_HOST_TOOLS_DIR=\"${XBE_HOST_TOOLS_DIR}\" "
+        "holds no xbe_recomp${CMAKE_HOST_EXECUTABLE_SUFFIX}: build cmake/XbeTools.cmake for this machine first "
+        "and point XBE_HOST_TOOLS_DIR at that build directory")
+endif()
+add_executable(xbe_recomp IMPORTED)
+set_target_properties(xbe_recomp PROPERTIES IMPORTED_LOCATION ${XBE_RECOMP_HOST})
+else()
 # x86 to C++ recompiler
 file(GLOB XBE_RECOMP_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/tools/recomp/*.cpp)
 add_executable(xbe_recomp ${XBE_RECOMP_SOURCES})
@@ -54,6 +72,7 @@ add_executable(xbe_symbols ${XBE_SDK_DIR}/tools/symbols/main.cpp)
 target_include_directories(xbe_symbols PRIVATE ${XBE_SDK_DIR}/runtime)
 target_compile_definitions(xbe_symbols PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(xbe_symbols PRIVATE Zydis tomlplusplus::tomlplusplus)
+endif()
 
 if(WIN32)
 set(XBE_IMGUI_SOURCES
@@ -185,6 +204,15 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_compile_definitions(${target} PRIVATE ${XBE_SHADER_DEFINES})
     target_include_directories(${target} SYSTEM PRIVATE ${XBE_SHADER_INCLUDES})
     endif()
-    # lld keeps the recompiled weak functions overridable by the host ones
+    # lld keeps the recompiled weak functions overridable by the host ones; the debug link writes the
+    # PDB that names them in a Windows crash dump
+    if(MSVC)
+    # clang-cl: CMake runs CMAKE_LINKER itself rather than through the compiler driver
+    if(NOT CMAKE_LINKER MATCHES "lld-link")
+        message(FATAL_ERROR "the recompiled image links with lld-link; CMAKE_LINKER is ${CMAKE_LINKER}")
+    endif()
+    target_link_options(${target} PRIVATE /DEBUG)
+    else()
     target_link_options(${target} PRIVATE -fuse-ld=lld -g)
+    endif()
 endfunction()
