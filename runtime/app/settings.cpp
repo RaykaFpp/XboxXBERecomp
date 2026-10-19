@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>  // std::getenv, used by the SIMSBO_HORPLUS gate
+#include <cstring>  // std::strcmp, same
 #include <fstream>
 #include <sstream>
 
