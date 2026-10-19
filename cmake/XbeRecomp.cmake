@@ -78,6 +78,7 @@ if(WIN32)
 # the Linux app/GPU/audio counterparts stay out of the Windows link entirely
 list(REMOVE_ITEM XBE_RUNTIME_SOURCES
     ${XBE_SDK_DIR}/runtime/app/main_sdl.cpp
+    ${XBE_SDK_DIR}/runtime/app/image_decode.cpp
     ${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp
     ${XBE_SDK_DIR}/runtime/gpu/spirv.cpp
     ${XBE_SDK_DIR}/runtime/audio/sdl_audio.cpp)

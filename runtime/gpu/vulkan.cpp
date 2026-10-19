@@ -51,6 +51,10 @@ constexpr int kFrames = 3;
 constexpr uint64_t kStaleFrames = 8;
 constexpr uint64_t kUploadSize = 64ull << 20;
 constexpr uint64_t kUploadReserve = 8ull << 20;
+// Descriptor sets one recording segment can allocate: one per draw, blit or depth
+// copy (a household frame is ~2200). EnsureSetRoom submits the segment before it
+// runs out, so no draw or blit is ever dropped for want of a set.
+constexpr uint32_t kSetsPerSegment = 8192;
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
 
 std::mutex g_handover_lock;
@@ -64,7 +68,7 @@ using VkPerfClock = std::chrono::steady_clock;
 double VkPerfMs(VkPerfClock::time_point t) { return std::chrono::duration<double, std::milli>(VkPerfClock::now() - t).count(); }
 struct VkPerf {
     double draw = 0, present = 0, clear = 0, copy = 0;
-    uint64_t draws = 0, skipped = 0, nopipeline = 0, verts = 0, raw = 0;
+    uint64_t draws = 0, skipped = 0, nopipeline = 0, nopipeShader = 0, nopipePso = 0, nopipeSet = 0, verts = 0, raw = 0;
     uint64_t upload = 0, overflow = 0, texups = 0, texupBytes = 0, newtex = 0;
     uint64_t targets = 0, rtups = 0, syncs = 0, shaders = 0, psos = 0, clears = 0, copies = 0;
 };
@@ -305,7 +309,7 @@ private:
     struct Frame {
         VkCommandBuffer cmd = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; bool fencePending = false;
         VkBuffer upload = VK_NULL_HANDLE; VkDeviceMemory uploadMem = VK_NULL_HANDLE; uint8_t* map = nullptr;
-        uint64_t used = 0; VkDescriptorPool pool = VK_NULL_HANDLE;
+        uint64_t used = 0; VkDescriptorPool pool = VK_NULL_HANDLE; uint32_t sets = 0;
         VkSemaphore imageAvailable = VK_NULL_HANDLE, renderFinished = VK_NULL_HANDLE;
         std::vector<std::function<void()>> garbage;
     };
@@ -328,6 +332,7 @@ private:
     VkRenderPass RenderPassFor(VkFormat color, VkFormat depth, bool hasColor, bool hasDepth);
     Frame& Cur() { return frames_[frame_ % kFrames]; }
     void EnsureRecording();
+    void EnsureSetRoom();
     void Submit(bool wait, VkSemaphore waitSem = VK_NULL_HANDLE, VkSemaphore signalSem = VK_NULL_HANDLE);
     void WaitFrame(Frame& f);
     void RunGarbage(Frame& f);
@@ -621,10 +626,14 @@ void VulkanBackend::EnsureRecording() {
     if (recording_) return;
     Frame& f = Cur();
     if (f.fencePending) WaitFrame(f);
-    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0;
+    vkResetCommandBuffer(f.cmd, 0); vkResetDescriptorPool(device_, f.pool, 0); f.used = 0; f.sets = 0;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(f.cmd, &bi); recording_ = true;
 }
+// Outside any render pass, before work that allocates a descriptor set (and before
+// its uploads, since a flush restarts the upload ring as well): a segment that has
+// used its pool is submitted here, because inside a pass it cannot be.
+void VulkanBackend::EnsureSetRoom() { if (recording_ && Cur().sets >= kSetsPerSegment) Flush(); }
 void VulkanBackend::RunGarbage(Frame& f) { for (auto& fn : f.garbage) fn(); f.garbage.clear(); }
 void VulkanBackend::WaitFrame(Frame& f) {
     if (f.fencePending) { vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX); f.fencePending = false; }
@@ -646,6 +655,9 @@ void VulkanBackend::Submit(bool wait, VkSemaphore waitSem, VkSemaphore signalSem
 }
 void VulkanBackend::Flush() { Submit(true); }
 VulkanBackend::Alloc VulkanBackend::UploadAlloc(uint64_t size, uint64_t align) {
+    // The ring belongs to the open segment: allocating after a submit but before the
+    // next segment starts would hand out space that segment's reset then reuses.
+    EnsureRecording();
     Frame& f = Cur();
     uint64_t o = (f.used + align - 1) & ~(align - 1);
     if (o + size <= kUploadSize) { f.used = o + size; g_vkPerf.upload += size; return {f.upload, o, f.map + o}; }
@@ -697,9 +709,11 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
             vkCreateFence(device_, &fi, nullptr, &f.fence);
             vkCreateSemaphore(device_, &si, nullptr, &f.imageAvailable);
             vkCreateSemaphore(device_, &si, nullptr, &f.renderFinished);
-            VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4096}};
+            // kSetsPerSegment sets of the one layout (2 uniform + 4 combined + 4
+            // sampler descriptors each), so the set count is the only limit
+            VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * kSetsPerSegment}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kSetsPerSegment}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4 * kSetsPerSegment}};
             VkDescriptorPoolCreateInfo di{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            di.maxSets = 2048; di.poolSizeCount = 3; di.pPoolSizes = sizes;
+            di.maxSets = kSetsPerSegment; di.poolSizeCount = 3; di.pPoolSizes = sizes;
             vkCreateDescriptorPool(device_, &di, nullptr, &f.pool);
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bi.size = kUploadSize;
@@ -1058,7 +1072,8 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkS
     ci.pDynamicState = &dyns; ci.layout = pipelineLayout_;
     ci.renderPass = RenderPassFor(VkFormat(k.rtfmt), depthFormat_, k.has_rt != 0, k.has_ds != 0); ci.subpass = 0;
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(device_, pipelineCache_, 1, &ci, nullptr, &pipe) != VK_SUCCESS) LOGE("vulkan: pipeline creation failed");
+    VkResult pr = vkCreateGraphicsPipelines(device_, pipelineCache_, 1, &ci, nullptr, &pipe);
+    if (pr != VK_SUCCESS) LOGE("vulkan: pipeline creation failed: VkResult %d vs %llx ps %llx", int(pr), (unsigned long long)k.vs, (unsigned long long)k.ps);
     if (pipe) g_vkPerf.psos++;
     pipelines_[h] = pipe; return pipe;
 }
@@ -1347,8 +1362,11 @@ bool UnitTexcoordsOf(const Assembled& a) {
 VkDescriptorSet VulkanBackend::AllocDrawSet(VkBuffer vcBuf, uint64_t vcOff, VkBuffer dcBuf, uint64_t dcOff, const DrawTextures& stages, const std::array<VkSampler, 4>& samplers) {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    EnsureRecording();  // as UploadAlloc: the set must come from the open segment's pool
     ai.descriptorPool = Cur().pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &setLayout_;
-    if (vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkResult ar = vkAllocateDescriptorSets(device_, &ai, &set);
+    if (ar != VK_SUCCESS) { LOG_FIRST(16, "vulkan: vkAllocateDescriptorSets failed: VkResult %d (%u sets in this segment)", int(ar), Cur().sets); return VK_NULL_HANDLE; }
+    Cur().sets++;
     VkDescriptorBufferInfo bi[2] = {{vcBuf, vcOff, sizeof(float) * 4 * 192}, {dcBuf, dcOff, sizeof(DrawConstants)}};
     VkDescriptorImageInfo ii[8]{}; VkWriteDescriptorSet w[10]{};
     for (int i = 0; i < 10; i++) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = uint32_t(i); w[i].descriptorCount = 1; }
@@ -1629,20 +1647,22 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     sh.vkey = VertexKeyOf(s, a, sh); EnsureVertexShader(s, a, sh);
     DrawTextures stages; if (!BindStageTextures(s, stages)) { g_vkPerf.skipped++; return; }
     PixelKey pk = MakePixelKey(s, stages.info); pk.quad = sh.quad; sh.pkey = Hash(&pk, sizeof(pk)); EnsurePixelShader(pk, sh);
-    if (!sh.vs || !sh.ps) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; LOG_FIRST(16, "vulkan: draw skipped, no shader: rt %08X", s.rt.data); return; }
+    if (!sh.vs || !sh.ps) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; g_vkPerf.nopipeShader++; LOG_FIRST(16, "vulkan: draw skipped, no shader: rt %08X", s.rt.data); return; }
     PsoKey k; BuildPsoKey(s, a, sh.vh, sh.ph, boundRt_, boundDs_, k);
-    VkPipeline pso = EnsurePipeline(k, sh.vs, sh.ps); if (!pso) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; return; }
+    VkPipeline pso = EnsurePipeline(k, sh.vs, sh.ps); if (!pso) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; g_vkPerf.nopipePso++; LOG_FIRST(16, "vulkan: draw skipped, no pipeline: rt %08X vs %llx ps %llx", s.rt.data, (unsigned long long)sh.vh, (unsigned long long)sh.ph); return; }
     GuestExtent size = BoundExtent(boundRt_ ? s.rt : s.zs);
     DrawConstants c{}; FillUvRect(s, prim, count, a, sh, stages, c); FillConstants(s, sh, stages, size, c);
     static const bool debugDraw = std::getenv("XBE_VK_DEBUG_DRAW") != nullptr;
     if (debugDraw && presents_ % 60 == 0) LogDraw(s, prim, count, a, sh, stages, c, size);
+    EnsureSetRoom();  // before the constants: a flush here restarts the upload ring
     Alloc vc = UploadAlloc(sizeof(s.vsc), 256); Alloc dc = UploadAlloc(sizeof(DrawConstants), 256);
     if (!vc.cpu || !dc.cpu) { g_vkPerf.skipped++; return; }
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc)); std::memcpy(dc.cpu, &c, sizeof(c));
     float bf[4]; ColorF(SimpleState(s, kMBlendColor), bf);
     std::array<VkSampler, 4> samplers; bool clampCoords = UnitTexcoordsOf(a);
     for (int i = 0; i < 4; i++) samplers[i] = StageSamplerFor(s, i, stages, clampCoords);
-    VkDescriptorSet set = AllocDrawSet(vc.buffer, vc.off, dc.buffer, dc.off, stages, samplers); if (!set) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; return; }
+    VkDescriptorSet set = AllocDrawSet(vc.buffer, vc.off, dc.buffer, dc.off, stages, samplers);
+    if (!set) { g_vkPerf.skipped++; g_vkPerf.nopipeline++; g_vkPerf.nopipeSet++; LOG_FIRST(16, "vulkan: draw skipped, no descriptor set: rt %08X present %llu", s.rt.data, (unsigned long long)presents_); return; }
     VkFramebuffer fb; BeginTargetPass(boundRt_, boundDs_, fb);
     vkCmdBindPipeline(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pso);
     vkCmdBindDescriptorSets(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &set, 0, nullptr);
@@ -1730,7 +1750,10 @@ void VulkanBackend::PrepareBlitSource(ImageRes& src, bool gamma) {
     // already begun it), so the source transition happens here, before that pass
     // begins. Recording it inside the pass is a validation error and, on RADV, leaves
     // the source in COLOR_ATTACHMENT_OPTIMAL while the shader reads it as
-    // SHADER_READ_ONLY - the read then returns stale/DCC-garbage colours.
+    // SHADER_READ_ONLY - the read then returns stale/DCC-garbage colours. The same
+    // holds for the descriptor set BlitToImage allocates inside that pass: its room
+    // is made here, where submitting a full segment is still possible.
+    EnsureSetRoom();
     Transition(src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (gamma) Transition(lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
@@ -1744,7 +1767,7 @@ void VulkanBackend::BlitToImage(VkFormat rtvFormat, uint32_t w, uint32_t h, Imag
     Alloc cb = UploadAlloc(256, 256); if (!cb.cpu) return;
     float cc[8] = {uv[0], uv[1], uv[2], uv[3], gamma ? 1.0f : 0, alpha ? 1.0f : 0, float(taps), mul};
     std::memcpy(cb.cpu, cc, sizeof(cc));
-    VkDescriptorSet set = AllocDrawSet(cb.buffer, cb.off, cb.buffer, cb.off, stages, samplers); if (!set) return;
+    VkDescriptorSet set = AllocDrawSet(cb.buffer, cb.off, cb.buffer, cb.off, stages, samplers); if (!set) { LOG_FIRST(16, "vulkan: blit dropped, no descriptor set (rtv %d %ux%u present %llu)", int(rtvFormat), w, h, (unsigned long long)presents_); return; }
     vkCmdBindPipeline(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &set, 0, nullptr);
     if (viewportRect) {
@@ -1852,14 +1875,16 @@ bool VulkanBackend::DepthCopyDraw(const State& s) {
     if (di == targets_.end() || si == targets_.end() || di == si) return false;
     VkPipeline pipe = EnsureBlitPipeline(VK_FORMAT_UNDEFINED, false, true); if (!pipe) return false;
     Target& dst = di->second; Target& src = si->second;
+    EnsureSetRoom();  // outside the pass and before the set's constants, as in Draw
     Transition(src.res, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    VkFramebuffer fb; BeginTargetPass(nullptr, &dst, fb);
     DrawTextures stages; stages.view[0] = src.res.SampleView();
     std::array<VkSampler, 4> samplers{nullSampler_, nullSampler_, nullSampler_, nullSampler_};
     Alloc cb = UploadAlloc(256, 256);
-    VkDescriptorSet set = AllocDrawSet(cb.buffer, cb.off, cb.buffer, cb.off, stages, samplers);
+    VkDescriptorSet set = cb.cpu ? AllocDrawSet(cb.buffer, cb.off, cb.buffer, cb.off, stages, samplers) : VK_NULL_HANDLE;
+    if (!set) { g_vkPerf.skipped++; LOG_FIRST(16, "vulkan: depth copy skipped, no descriptor set: rt %08X present %llu", s.rt.data, (unsigned long long)presents_); return true; }
+    VkFramebuffer fb; BeginTargetPass(nullptr, &dst, fb);
     vkCmdBindPipeline(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    if (set) vkCmdBindDescriptorSets(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(Cmd(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1, &set, 0, nullptr);
     VkViewport vp{0, float(dst.h), float(dst.w), -float(dst.h), 0, 1}; vkCmdSetViewport(Cmd(), 0, 1, &vp);
     VkRect2D sc{{0, 0}, {dst.w, dst.h}}; vkCmdSetScissor(Cmd(), 0, 1, &sc);
     vkCmdDraw(Cmd(), 3, 1, 0, 0); EndPass();
@@ -1938,9 +1963,9 @@ void VulkanBackend::LogPerf() {
          g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_hle_ns.exchange(0) / n / 1e6,
          g_perf_sendstate_ns.exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
          g_perf_sync_late.exchange(0) / n);
-    LOGI("perf: per frame %.0f draws (%.0f raw) %.0f skipped %.0f nopipeline %.0fk verts %.1f MB upload %.1f overflow | "
+    LOGI("perf: per frame %.0f draws (%.0f raw) %.0f skipped %.0f nopipeline (shader %.0f pso %.0f set %.0f) %.0fk verts %.1f MB upload %.1f overflow | "
          "%.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f read-backs | %llu shaders %llu psos this second | %.0f clears %.0f copies per frame",
-         p.draws / n, p.raw / n, p.skipped / n, p.nopipeline / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n,
+         p.draws / n, p.raw / n, p.skipped / n, p.nopipeline / n, p.nopipeShader / n, p.nopipePso / n, p.nopipeSet / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n,
          p.texups / n, p.texupBytes / n / 1048576.0, p.newtex / n, p.targets / n, p.rtups / n, p.syncs / n,
          (unsigned long long)p.shaders, (unsigned long long)p.psos, p.clears / n, p.copies / n);
     g_vkPerf = VkPerf{};
@@ -1955,7 +1980,15 @@ void VulkanBackend::PeriodicCapture(Target* front) {
     std::filesystem::path dir = std::filesystem::weakly_canonical(app::ExeDir() / diag::CaptureDir(), ec);
     std::filesystem::create_directories(dir, ec);
     char name[64]; std::snprintf(name, sizeof(name), "front_%05llu.bmp", (unsigned long long)presents_);
+    LOGI("vulkan: capture probe: present %llu image %p view %p tracked layout %d before first sample", (unsigned long long)presents_, (void*)front->res.image, (void*)front->res.view, int(front->res.layout));
     CapSaveColorAs(*front, dir / name);
+    {   // second sample of the same target in the same Present, after the first
+        // sample's read-back flushed the command buffer (which also resets the
+        // frame's descriptor pool): the pair is the D2 before/after instrument
+        char bname[64]; std::snprintf(bname, sizeof(bname), "front_%05llu_b.bmp", (unsigned long long)presents_);
+        CapSaveColorAs(*front, dir / bname);
+        LOGI("vulkan: capture probe: second sample done, tracked layout now %d", int(front->res.layout));
+    }
     {   // the host-resolution target as well: the guest dump above shrinks the
         // (possibly widened) target to guest size and hides the widening geometry
         std::vector<uint8_t> px;
@@ -2024,8 +2057,8 @@ void VulkanBackend::Present(const Surface& front) {
         float v0 = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_top) / float(guestH_) : 0.0f;
         float dv = app::kGame.picture_height && guestH_ ? float(app::kGame.picture_height) / float(guestH_) : 1.0f;
         float sx = 0, sy = v0 * float(t->h), sw = float(t->w), sh = dv * float(t->h);
-        LOGI("vulkan: present %llu image %u front %08X guest %ux%u target %ux%u scale %.3f widen %.3f targetAspect %.3f srcAspect %.3f window %ux%u srcPx (%.0f,%.0f %.0fx%.0f) srcUv (0,%.3f)-(1,%.3f) dst (%.0f,%.0f %.0fx%.0f) gamma=%d",
-             (unsigned long long)presents_, imageIndex, t->data, t->gw, t->gh, t->w, t->h, scale_, widen_, app::TargetAspect(), aspect, bbW_, bbH_, sx, sy, sw, sh, v0, dv, (float(bbW_) - vw) / 2, (float(bbH_) - vh) / 2, vw, vh, int(gamma_));
+        LOGI("vulkan: present %llu image %u front %08X guest %ux%u target %ux%u scale %.3f widen %.3f targetAspect %.3f srcAspect %.3f window %ux%u srcPx (%.0f,%.0f %.0fx%.0f) srcUv (0,%.3f)-(1,%.3f) dst (%.0f,%.0f %.0fx%.0f) gamma=%d vkimage %p view %p sampleview %p layout %d",
+             (unsigned long long)presents_, imageIndex, t->data, t->gw, t->gh, t->w, t->h, scale_, widen_, app::TargetAspect(), aspect, bbW_, bbH_, sx, sy, sw, sh, v0, dv, (float(bbW_) - vw) / 2, (float(bbH_) - vh) / 2, vw, vh, int(gamma_), (void*)t->res.image, (void*)t->res.view, (void*)t->res.SampleView(), int(t->res.layout));
     }
     presents_++; presentsSeen_.store(presents_); frame_++;
     ReleaseOldTextures();
