@@ -94,6 +94,6 @@ struct DrawConstants {
     float mat[5][4];     // material diffuse, ambient, specular, emissive, power
     float amb[4];        // D3DRS_AMBIENT
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
+    float uvrect[4][4];  // per stage: the draw's texcoord rect inset by half a texel (min xy, max xy), all zero when unused
 };
-
 }  // namespace gpu

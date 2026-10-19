@@ -240,6 +240,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc = app::WndProc;
     wc.hInstance = inst;
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    // without this the class cursor is NULL, so the window keeps whatever the shell last set -
+    // the app-starting spinner stays over the game for as long as it runs
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = app::kGame.name;
     RegisterClassExW(&wc);

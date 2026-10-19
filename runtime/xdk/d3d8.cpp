@@ -41,6 +41,10 @@ using namespace kernel;
 #define SYM_D3DDevice_GetVertexShaderFunction FFFFFE03
 #define HAS_D3DDevice_GetVertexShaderFunction 0
 #endif
+#ifndef SYM_D3DDevice_Reset
+#define SYM_D3DDevice_Reset FFFFFE04
+#define HAS_D3DDevice_Reset 0
+#endif
 
 namespace d3d {
 
@@ -344,45 +348,45 @@ using namespace d3d;
 
 // device
 
-HLE_STDCALL(Direct3D_CreateDevice, 6) {
-    XDK_REQUIRE("d3d", XDK_DATA(D3D_Device), XDK_DATA(D3D_pDevice), XDK_DATA(D3D_DirtyFlags),
-                XDK_DATA(D3D_DeferredTextureState), XDK_DATA(D3D_RenderState), XDK_DATA(D3D_Streams),
-                XDK_DATA(D3D_SimpleRenderStateEncode));
-    XDK_REQUIRE("d3d", XDK_KEY(CDevice_Push), XDK_KEY(CDevice_PushThreshold), XDK_KEY(CDevice_BaseVertex),
-                XDK_KEY(CDevice_IndexBuffer), XDK_KEY(CDevice_ZScale), XDK_KEY(CDevice_SuperSampleX),
-                XDK_KEY(CDevice_SuperSampleY), XDK_KEY(CDevice_Transforms), XDK_KEY(CDevice_Textures),
-                XDK_KEY(CDevice_RenderTarget), XDK_KEY(CDevice_Depth), XDK_KEY(CDevice_BackBuffer),
-                XDK_KEY(CDevice_FrontBuffer), XDK_KEY(CDevice_SwapCount), XDK_KEY(CDevice_Size),
-                XDK_KEY(DirtyFlags_Texture), XDK_KEY(TextureState_Stage), XDK_KEY(Stream_Size),
-                XDK_KEY(Stream_Stride), XDK_KEY(Stream_Buffer));
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t pp = a[4];  // D3DPRESENT_PARAMETERS
-    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
-    uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
-    if (!w) w = 640;
-    if (!h) h = 480;
+namespace {
+// Frame surfaces and device fields for one set of presentation parameters, shared by
+// Direct3D_CreateDevice (first creation, device already zeroed by the caller) and
+// D3DDevice_Reset (mode change on a live device). A Reset that asks for the surfaces
+// already in place reuses them: this title Resets at every movie/scene transition, and
+// allocating a fresh 640x480 front/back/depth triple each time leaked ~3.6 MB of the
+// 64 MB physical space per Reset until surface allocation started failing (data
+// physical 0, whose read-back then wrote over low kernel memory). Changed parameters
+// still allocate fresh surfaces and leak the old ones, as before: the title may hold
+// their headers, and a size/format change is rare.
+void SetupPresentation(X86Context& ctx, uint32_t w, uint32_t h, uint32_t fmt, uint32_t count, uint32_t auto_depth,
+                       uint32_t depth_fmt, bool fresh) {
     g_frame_w = w;
     g_frame_h = h;
-    LOGI("d3d: CreateDevice %ux%u format %X buffers %u depth %u format %X interval %X flags %X", w, h, fmt, count,
-         auto_depth, depth_fmt, interval, R32(pp + 0x28));
-    std::memset(HostPtr(kDevice), 0, XDK_CDevice_Size);
-    W32(kDevicePtr, kDevice);
-    ScratchPush();
-
     uint32_t color_fmt = gpu::LinearColorFormat(fmt);
-    g_buffer_count = std::min<uint32_t>(count + 1, 3);
-    for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
-    g_depth = 0;
-    if (auto_depth) {
-        uint32_t zf = gpu::LinearDepthFormat(depth_fmt);
-        g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);  // 0x30 LIN_D16, 0x31 LIN_F16
+    const uint32_t want_count = std::min<uint32_t>(count + 1, 3);
+    static uint32_t pres_w = 0, pres_h = 0, pres_fmt = 0, pres_count = 0, pres_auto_depth = 0, pres_depth_fmt = 0;
+    const bool reuse = g_buffers[0] != 0 && pres_w == w && pres_h == h && pres_fmt == color_fmt &&
+                       pres_count == want_count && pres_auto_depth == auto_depth && pres_depth_fmt == depth_fmt;
+    if (!reuse) {
+        g_buffer_count = want_count;
+        for (uint32_t i = 0; i < g_buffer_count; i++) g_buffers[i] = NewSurface(w, h, color_fmt, 4);
+        g_depth = 0;
+        if (auto_depth) {
+            uint32_t zf = gpu::LinearDepthFormat(depth_fmt);
+            g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);  // 0x30 LIN_D16, 0x31 LIN_F16
+        }
+        pres_w = w; pres_h = h; pres_fmt = color_fmt; pres_count = want_count;
+        pres_auto_depth = auto_depth; pres_depth_fmt = depth_fmt;
     }
     if (!g_backend) {
         g_backend = gpu::CreateBackend();
         if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
-    g_state_data = gpu::State{};  // every block marked
+    // CreateDevice starts from a clean slate; Reset (like the guest body, which only
+    // recreates the surfaces, re-points the target and clears) keeps the bound
+    // shaders, streams and textures, so only the targets and viewport move.
+    if (fresh) g_state_data = gpu::State{};  // every block marked
     Set(g_state.viewport, {0, 0, w, h, 0.0f, 1.0f});
     SetDev(kDevRenderTarget, g_buffers[1]);
     SetDev(kDevDepth, g_depth);
@@ -414,12 +418,62 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     Set(g_state.rt, SurfaceOf(g_buffers[1]));
     Set(g_state.zs, SurfaceOf(g_depth));
     UpdateViewportConstants();
-    ApplyDefaultStates(ctx);
+    if (fresh) ApplyDefaultStates(ctx);
+}
+}  // namespace
+
+HLE_STDCALL(Direct3D_CreateDevice, 6) {
+    XDK_REQUIRE("d3d", XDK_DATA(D3D_Device), XDK_DATA(D3D_pDevice), XDK_DATA(D3D_DirtyFlags),
+                XDK_DATA(D3D_DeferredTextureState), XDK_DATA(D3D_RenderState), XDK_DATA(D3D_Streams),
+                XDK_DATA(D3D_SimpleRenderStateEncode));
+    XDK_REQUIRE("d3d", XDK_KEY(CDevice_Push), XDK_KEY(CDevice_PushThreshold), XDK_KEY(CDevice_BaseVertex),
+                XDK_KEY(CDevice_IndexBuffer), XDK_KEY(CDevice_ZScale), XDK_KEY(CDevice_SuperSampleX),
+                XDK_KEY(CDevice_SuperSampleY), XDK_KEY(CDevice_Transforms), XDK_KEY(CDevice_Textures),
+                XDK_KEY(CDevice_RenderTarget), XDK_KEY(CDevice_Depth), XDK_KEY(CDevice_BackBuffer),
+                XDK_KEY(CDevice_FrontBuffer), XDK_KEY(CDevice_SwapCount), XDK_KEY(CDevice_Size),
+                XDK_KEY(DirtyFlags_Texture), XDK_KEY(TextureState_Stage), XDK_KEY(Stream_Size),
+                XDK_KEY(Stream_Stride), XDK_KEY(Stream_Buffer));
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t pp = a[4];  // D3DPRESENT_PARAMETERS
+    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
+    uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
+    if (!w) w = 640;
+    if (!h) h = 480;
+    LOGI("d3d: CreateDevice %ux%u format %X buffers %u depth %u format %X interval %X flags %X", w, h, fmt, count,
+         auto_depth, depth_fmt, interval, R32(pp + 0x28));
+    std::memset(HostPtr(kDevice), 0, XDK_CDevice_Size);
+    W32(kDevicePtr, kDevice);
+    ScratchPush();
+    SetupPresentation(ctx, w, h, fmt, count, auto_depth, depth_fmt, true);
     if (a[5]) W32(a[5], kDevice);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
+
+// D3DDevice_Reset(pPresentationParameters), stdcall ret 4: the guest body (Sims 2 0x271570)
+// kicks the GPU idle, tears down and recreates the display surfaces through the NV2A
+// miniport at CDevice+0x1C28, then re-establishes the render target and clears. The host
+// has no miniport, so it applies the parameters to its own device state instead, through
+// the same SetupPresentation path as CreateDevice, and returns S_OK.
+HLE_STDCALL(D3DDevice_Reset, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t pp = a[0];  // D3DPRESENT_PARAMETERS
+    if (!pp) return 0x88760869;  // D3DERR_INVALIDCALL
+    uint32_t w = R32(pp), h = R32(pp + 4), fmt = R32(pp + 8), count = std::max<uint32_t>(R32(pp + 12), 1);
+    uint32_t auto_depth = R32(pp + 0x20), depth_fmt = R32(pp + 0x24), interval = R32(pp + 0x30);
+    if (!w) w = 640;
+    if (!h) h = 480;
+    LOGI("d3d: Reset %ux%u format %X buffers %u multisample %X depth %u format %X flags %X refresh %u interval %X",
+         w, h, fmt, count, R32(pp + 0x10), auto_depth, depth_fmt, R32(pp + 0x28), R32(pp + 0x2C), interval);
+    if (g_backend) g_backend->Flush();  // the guest's KickOffAndWaitForIdle
+    ScratchPush();
+    SetupPresentation(ctx, w, h, fmt, count, auto_depth, depth_fmt, false);
+    // the guest tail: SetRenderTarget(back buffer, auto depth) then Clear(0, 0, 3, 0, 1.0f, 0);
+    // SetupPresentation already pointed the device and g_state at the new buffers
+    if (g_backend) g_backend->Clear(g_state, 0, nullptr, 3, 0, 1.0f, 0);
+    return 0;
+}
 
 // synchronisation, the renderer never runs behind
 
@@ -606,6 +660,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     }
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     g_presents++;
+    LOG_FIRST(8, "d3d: Swap %u", g_presents.load());
     // the kept display is shown until the title presents its own
     kernel::SetSavedDataAddress(0);
     // the ramp an inlined SetGammaRamp left for the vertical blank that shows this swap

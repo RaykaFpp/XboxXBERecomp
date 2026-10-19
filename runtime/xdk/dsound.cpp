@@ -138,6 +138,12 @@ thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushe
 std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
 bool g_started = false;
 uint32_t g_ds = 0;
+// Host-side audio proof counters (see docs/audio.md): what the guest asked for,
+// what it queued, and what the mixer consumed.
+uint64_t g_stat_buffers = 0, g_stat_streams = 0, g_stat_process = 0, g_stat_process_bytes = 0, g_stat_completed = 0,
+         g_stat_getstatus = 0, g_stat_plays = 0, g_stat_renders = 0, g_stat_setdata = 0;
+float g_stat_peak = 0.0f;
+
 
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
 
@@ -197,6 +203,7 @@ float Sample(Voice& v, uint32_t data, uint32_t f, int c) {
 }
 
 void Complete(Voice& v, Packet& pk, uint32_t status) {
+    g_stat_completed++;
     if (pk.completed_ptr) W32(pk.completed_ptr, status == 0 ? pk.size : pk.used);
     if (pk.status_ptr) W32(pk.status_ptr, status);
     if (v.callback) {
@@ -325,6 +332,25 @@ void Render(float* out, uint32_t frames) {
         }
     }
     for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+    // Mixer-side proof: peak of what was just mixed, plus a throttled census.
+    for (uint32_t i = 0; i < frames * 2; i++) g_stat_peak = std::max(g_stat_peak, std::fabs(out[i]));
+    if (++g_stat_renders % 500 == 0) {
+        uint32_t live = 0, playing = 0, queued_pk = 0;
+        uint64_t queued_bytes = 0;
+        for (auto& [obj, v] : g_voices) {
+            live++;
+            if (v.stream ? !v.packets.empty() : v.playing) playing++;
+            queued_pk += uint32_t(v.packets.size());
+            for (auto& pk : v.packets) queued_bytes += pk.size;
+        }
+        LOGI("dsound: mix renders=%llu voices=%u sounding=%u queued_pk=%u queued_bytes=%llu process=%llu "
+             "process_bytes=%llu completed=%llu plays=%llu setdata=%llu getstatus=%llu peak=%.4f",
+             (unsigned long long)g_stat_renders, live, playing, queued_pk, (unsigned long long)queued_bytes,
+             (unsigned long long)g_stat_process, (unsigned long long)g_stat_process_bytes,
+             (unsigned long long)g_stat_completed, (unsigned long long)g_stat_plays,
+             (unsigned long long)g_stat_setdata, (unsigned long long)g_stat_getstatus, g_stat_peak);
+        g_stat_peak = 0.0f;
+    }
 }
 
 int64_t NowMs() {
@@ -366,6 +392,7 @@ void ReadFormat(Voice& v, uint32_t wfx) {
     v.align = std::max<uint16_t>(R16(wfx + 12), 1);
     v.bits = R16(wfx + 14);
     if (v.tag != 1 && v.tag != 0x69) LOG_FIRST(8, "dsound: format tag %X not supported", v.tag);
+    LOG_FIRST(64, "dsound: format tag=%X ch=%u rate=%u align=%u bits=%u", v.tag, v.channels, v.rate, v.align, v.bits);
 }
 
 // DSMIXBINS: the voice's bins and their volumes
@@ -409,6 +436,8 @@ uint32_t NewBuffer(uint32_t desc, uint32_t out) {
         v.data = v.owned = mem::AllocContiguous(bytes, 0, 0xFFFFFFFF, 4);
         v.bytes = v.play_len = v.loop_len = bytes;
     }
+    g_stat_buffers++;
+    LOG_FIRST(48, "dsound: buffer #%llu obj=%08X tag=%X ch=%u rate=%u bits=%u bytes=%u flags=%08X bins=%u", (unsigned long long)g_stat_buffers, obj, v.tag, v.channels, v.rate, v.bits, bytes, flags, v.nbins);
     W32(out, obj);
     return 0;
 }
@@ -612,6 +641,7 @@ BUFFER(Release, 1) {
 }
 BUFFER(Unlock, 5) { return 0; }
 BUFFER(SetBufferData, 3) {
+    g_stat_setdata++;
     if (a[1] == v.data && a[2] == v.bytes) return 0;
     // the library frees its own memory, and makes it again for a size with no data
     if (v.owned && v.owned != a[1]) {
@@ -627,6 +657,7 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
+    g_stat_plays++;
     v.playing = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
@@ -637,6 +668,7 @@ BUFFER(Play, 4) {
 // start time. The game passes time 0 (play now); a future time plays now too,
 // the scheduling offset is not reproduced. Flags share Play's low bits.
 BUFFER(PlayEx, 4) {
+    g_stat_plays++;
     v.playing = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
@@ -783,6 +815,8 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
+    g_stat_streams++;
+    LOGI("dsound: stream #%llu obj=%08X tag=%X ch=%u rate=%u bits=%u align=%u maxpk=%u flags=%08X bins=%u cb=%08X", (unsigned long long)g_stat_streams, obj, v.tag, v.channels, v.rate, v.bits, v.align, v.max_packets, flags, v.nbins, v.callback);
     W32(a[1], obj);
     return 0;
 }
@@ -844,6 +878,7 @@ STREAM(GetInfo, 2) {
     return 0;
 }
 STREAM(GetStatus, 2) {
+    g_stat_getstatus++;
     W32(a[1], v.packets.size() < v.max_packets ? 1u : 0u);  // XMEDIASTATUS_ACCEPT_INPUT
     return 0;
 }
@@ -851,6 +886,9 @@ STREAM(Process, 3) {
     uint32_t in = a[1];
     if (!in) return 0;
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
+    g_stat_process++;
+    g_stat_process_bytes += pk.size;
+    LOG_FIRST(24, "dsound: process #%llu obj=%08X data=%08X size=%u tag=%X ch=%u rate=%u queued=%u", (unsigned long long)g_stat_process, v.obj, pk.data, pk.size, v.tag, v.channels, v.rate, unsigned(v.packets.size()) + 1);
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
     v.packets.push_back(pk);
