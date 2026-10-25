@@ -39,6 +39,7 @@
 #pragma comment(linker, "/EXPORT:tan=ucrtbase.tan")
 #pragma comment(linker, "/EXPORT:atan2=ucrtbase.atan2")
 #pragma comment(linker, "/EXPORT:fmod=ucrtbase.fmod")
+#pragma comment(linker, "/EXPORT:remainder=ucrtbase.remainder")
 #pragma comment(linker, "/EXPORT:sqrt=ucrtbase.sqrt")
 #pragma comment(linker, "/EXPORT:sqrtf=ucrtbase.sqrtf")
 #pragma comment(linker, "/EXPORT:log2=ucrtbase.log2")
