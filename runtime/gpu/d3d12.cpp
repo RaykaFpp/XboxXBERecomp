@@ -415,6 +415,7 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
+    void WaitGpuFrame(uint64_t n) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
     bool DeliverLate(uint32_t data) override;
@@ -718,6 +719,7 @@ private:
     std::unordered_map<uint32_t, Late> late_;
     std::mutex late_lock_;                      // DeliverLate runs on the title's thread
     std::atomic<uint64_t> presents_seen_{0};    // presents_ for DeliverLate
+    std::atomic<uint64_t> present_fence_[kFrames + 1] = {};  // by presents_, for WaitGpuFrame
     Assembled asm_;  // kept between draws for its buffers
     // visibility tests: an occlusion query per counted draw, summed into report memory once the GPU is done
     struct Query {
@@ -3045,6 +3047,7 @@ void D3D12Backend::Present(const Surface& front) {
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
     Submit(false);
+    present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
     DeliverReports();
     bool vsync = app::Get().vsync;
     auto perf_swap = PerfClock::now();
@@ -3059,6 +3062,12 @@ void D3D12Backend::Present(const Surface& front) {
     CountFps();
     if (diag::Perf()) LogPerf();
     ApplySettings();
+}
+
+// the slot is not reused before the caller's wait: the title runs at most one present ahead
+void D3D12Backend::WaitGpuFrame(uint64_t n) {
+    uint64_t fence = present_fence_[n % (kFrames + 1)].load();
+    if (fence > fence_->GetCompletedValue()) fence_->SetEventOnCompletion(fence, nullptr);
 }
 
 void D3D12Backend::ApplySettings() {
