@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 #include <toml++/toml.hpp>
@@ -129,8 +130,30 @@ bool Widescreen() {
     return wide;
 }
 
+// Output for every frame: the desktop mode lookup reads the registry, so it runs again only when the resolution
+// setting or the window's monitor changes
+Mode CachedOutput() {
+    struct Key {
+        uint32_t width;
+        uint32_t height;
+        HMONITOR monitor;
+        bool operator==(const Key&) const = default;
+    };
+    static std::mutex lock;
+    static Key key{};
+    static Mode mode{};
+    const Settings& s = Get();
+    Key now{s.width, s.height, MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY)};
+    std::lock_guard<std::mutex> guard(lock);
+    if (!(now == key) || !mode.height) {
+        key = now;
+        mode = Output();
+    }
+    return mode;
+}
+
 float RenderScale(uint32_t guest_height) {
-    float h = Output().height * (Get().render_percent / 100.0f);
+    float h = CachedOutput().height * (Get().render_percent / 100.0f);
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 }
 

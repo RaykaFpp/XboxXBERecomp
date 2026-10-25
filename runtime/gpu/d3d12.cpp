@@ -99,8 +99,11 @@ struct Perf {
 Perf g_perf;
 struct PerfScope {
     double& acc;
-    PerfClock::time_point t = PerfClock::now();
-    ~PerfScope() { acc += PerfMs(t); }
+    bool on = diag::Perf();
+    PerfClock::time_point t = on ? PerfClock::now() : PerfClock::time_point{};
+    ~PerfScope() {
+        if (on) acc += PerfMs(t);
+    }
 };
 
 // F3 captures only with diag::CaptureDir set
@@ -387,6 +390,14 @@ struct DrawTextures {
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
 };
 
+// the last draw's texture views and their slots, reused by a draw with the same views in the same frame
+struct ViewTable {
+    ID3D12Resource* res[4] = {};
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv[4] = {};
+    uint32_t slot = 0;
+    uint64_t frame = UINT64_MAX;
+};
+
 // a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
 struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
@@ -534,6 +545,7 @@ private:
     void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
+    bool SameViews(const DrawTextures& stages) const;
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s);
@@ -650,6 +662,7 @@ private:
     uint64_t fence_value_ = 0;
     Frame frames_[kFrames];
     uint64_t frame_ = 0;
+    ViewTable last_views_;
     ComPtr<ID3D12GraphicsCommandList> cl_;
     ComPtr<ID3D12DescriptorHeap> srv_heap_;
     ComPtr<ID3D12DescriptorHeap> smp_heap_;
@@ -924,6 +937,7 @@ void D3D12Backend::Submit(bool wait) {
         f.garbage.clear();
         f.used = 0;
         f.srv = 0;
+        last_views_.frame = UINT64_MAX;
         cl_->Reset(f.alloc.Get(), nullptr);
         Begin();
     }
@@ -978,6 +992,7 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     if (f.srv + n > per) {
         LOG_FIRST(4, "d3d12: descriptor ring wrapped within a frame");
         f.srv = 0;
+        last_views_.frame = UINT64_MAX;
     }
     uint32_t i = uint32_t(frame_ % kFrames) * per + f.srv;
     f.srv += n;
@@ -1974,13 +1989,17 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
 }
 
 bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
-    auto perf_t = PerfClock::now();
     draw_rt_ = bound_rt_;
     draw_ds_ = bound_ds_;
-    for (int i = 0; i < 4; i++) stages.res[i] = BindTexture(s, i, stages);
-    g_perf.bind += PerfMs(perf_t);
-    // textures may have recorded copies that unbound the targets
-    return BindTargets(s);
+    {
+        PerfScope perf_bind{g_perf.bind};
+        for (int i = 0; i < 4; i++) stages.res[i] = BindTexture(s, i, stages);
+    }
+    // textures may have recorded copies that unbound the targets or moved them out of their target states
+    if (bound_rt_ != draw_rt_ || bound_ds_ != draw_ds_) return BindTargets(s);
+    if (bound_rt_) Transition(bound_rt_->res.Get(), bound_rt_->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (bound_ds_) Transition(bound_ds_->res.Get(), bound_ds_->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    return true;
 }
 
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
@@ -2378,19 +2397,39 @@ bool UnitTexcoords(const Assembled& a) {
     return any;
 }
 
+// UnitTexcoords only changes stages that wrap
+bool AnyStageWraps(const State& s) {
+    for (const auto& t : s.tss) {
+        if (t[kTssAddressU] == kTaddressWrap || t[kTssAddressV] == kTaddressWrap) return true;
+    }
+    return false;
+}
+
+bool D3D12Backend::SameViews(const DrawTextures& stages) const {
+    if (last_views_.frame != frame_) return false;
+    if (std::memcmp(last_views_.res, stages.res, sizeof(stages.res))) return false;
+    return !std::memcmp(last_views_.sv, stages.sv, sizeof(stages.sv));
+}
+
 // a stage without a texture gets a null view of its kind; the samplers read the views after
 void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages) {
-    uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
-        D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[i];
-        if (!stages.res[i]) {
-            sv.ViewDimension = NullViewDimension(stages.info[i].kind);
-            sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        }
-        dev_->CreateShaderResourceView(stages.res[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+        if (stages.res[i]) continue;
+        stages.sv[i].ViewDimension = NullViewDimension(stages.info[i].kind);
+        stages.sv[i].Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
-    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), slot, srv_inc_));
-    uint32_t samplers = EnsureStageSamplers(s, stages, UnitTexcoords(a));
+    if (!SameViews(stages)) {
+        uint32_t slot = AllocSrvSlots(4);
+        for (int i = 0; i < 4; i++) {
+            dev_->CreateShaderResourceView(stages.res[i], &stages.sv[i], Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+        }
+        std::memcpy(last_views_.res, stages.res, sizeof(stages.res));
+        std::memcpy(last_views_.sv, stages.sv, sizeof(stages.sv));
+        last_views_.slot = slot;
+        last_views_.frame = frame_;
+    }
+    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), last_views_.slot, srv_inc_));
+    uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
     cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
 }
 
@@ -2468,9 +2507,11 @@ struct DrawEnd {
 // Assemble, timed and counted
 bool D3D12Backend::AssembleDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count,
                                 const uint8_t* indices, Assembled& a) {
-    auto perf_t = PerfClock::now();
-    bool assembled = Assemble(s, prim, start, count, indices, a);
-    g_perf.assemble += PerfMs(perf_t);
+    bool assembled;
+    {
+        PerfScope perf_assemble{g_perf.assemble};
+        assembled = Assemble(s, prim, start, count, indices, a);
+    }
     g_perf.verts += a.vertex_count;
     g_perf.raw += a.vertices.empty();
     return assembled;
