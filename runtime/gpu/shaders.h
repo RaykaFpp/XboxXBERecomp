@@ -58,6 +58,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode 
 std::string PixelHlsl(const PixelKey& k);
 // a screen quad's vertex or pixel shader: texture coordinates as the quad was drawn, before its far edges were pulled out
 std::string QuadHlsl(std::string s);
+// depth stored reversed (1 at the near clip, 0 at the far one) from DrawConstants::zparams, for a vertex shader
+std::string ReversedDepthHlsl(std::string s);
 // the geometry shader that draws a point as its console pixel
 std::string PointHlsl();
 
@@ -78,6 +80,7 @@ struct ShaderHooks {
     virtual std::string Output() const;
 };
 inline const ShaderHooks* g_shader_hooks = nullptr;
+inline bool g_reversed_depth = false;  // the renderer stores depth reversed: shadow compares turn r with it
 
 // the constant buffer layout both stages share, register b1
 struct DrawConstants {
@@ -101,6 +104,7 @@ struct DrawConstants {
     float amb[4];        // D3DRS_AMBIENT
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
+    float zparams[4];    // ReversedDepthHlsl: a w buffer's scale (0 for a z buffer), its far w, the polygon offset
 };
 
 }  // namespace gpu

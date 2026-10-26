@@ -139,6 +139,13 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
+// Depth is reversed in a 32 bit float buffer: 1 at the near clip, 0 at the far one, where a float keeps its finest
+// steps; a 24 bit buffer storing z / w lost the steps that told distant surfaces apart
+constexpr DXGI_FORMAT kDepthTypeless = DXGI_FORMAT_R32G8X24_TYPELESS;
+constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+constexpr DXGI_FORMAT kDepthRead = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+constexpr float kDepthFar = 0;
+
 const char* kDepthHlsl = R"(
 Texture2D<float> img : register(t0);
 SamplerState ps : register(s1);
@@ -542,6 +549,7 @@ private:
     void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
     float TargetScale() const;  // host pixels per console pixel of the bound target
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
+    void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                          GuestExtent size, DrawConstants& c);
     void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
@@ -769,6 +777,7 @@ private:
 };
 
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
+    g_reversed_depth = true;
     guest_w_ = width;
     guest_h_ = height;
     HWND hwnd = static_cast<HWND>(app::Window());
@@ -1041,10 +1050,10 @@ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
     D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
     D3D12_CLEAR_VALUE cv{};
     if (t.depth) {
-        td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        td.Format = kDepthTypeless;
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        cv.DepthStencil.Depth = 1;
+        cv.Format = kDepthFormat;
+        cv.DepthStencil.Depth = kDepthFar;
         t.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     } else {
         td.Format = t.fmt;
@@ -1064,12 +1073,11 @@ bool D3D12Backend::CreateTargetView(Target& t) {
     pool.pop_back();
     if (t.depth) {
         D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
-        dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dv.Format = kDepthFormat;
         dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         dev_->CreateDepthStencilView(t.res.Get(), &dv, Cpu(dsv_heap_.Get(), t.view, dsv_inc_));
-        float one = 1;
         cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_),
-                                   D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, one, 0, 0, nullptr);
+                                   D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, kDepthFar, 0, 0, nullptr);
     } else {
         dev_->CreateRenderTargetView(t.res.Get(), nullptr, Cpu(rtv_heap_.Get(), t.view, rtv_inc_));
         float black[4] = {0, 0, 0, 0};
@@ -1187,7 +1195,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
     p.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     p.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    p.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    p.DSVFormat = kDepthFormat;
     p.SampleDesc.Count = 1;
     if (FAILED(dev_->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
@@ -1203,7 +1211,7 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     SetFullViewport(dst.w, dst.h);
     uint32_t slot = AllocSrvSlots(1);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    sv.Format = kDepthRead;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
@@ -1516,10 +1524,16 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(uint32_t topo) {
 constexpr uint32_t kFillWireframe = 0x1B01;  // D3DFILL_WIREFRAME
 constexpr uint32_t kCullCw = 0x900;          // D3DCULL_CW
 
+// a D3DCMP test on reversed depth: less and greater trade places
+D3D12_COMPARISON_FUNC ReversedCmp(uint32_t v) {
+    static const uint8_t mirror[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+    return D3D12_COMPARISON_FUNC(mirror[Cmp(v) - 1] + 1);
+}
+
 void FillDepthStencilDesc(const PsoKey& k, D3D12_DEPTH_STENCIL_DESC& ds) {
     ds.DepthEnable = k.zen;
     ds.DepthWriteMask = k.zwrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    ds.DepthFunc = Cmp(k.zfunc);
+    ds.DepthFunc = ReversedCmp(k.zfunc);
     ds.StencilEnable = k.sten;
     ds.StencilReadMask = UINT8(k.smask);
     ds.StencilWriteMask = UINT8(k.swmask);
@@ -1553,7 +1567,7 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.PrimitiveTopologyType = TopologyType(k.topo);
     d.NumRenderTargets = k.has_rt ? 1 : 0;
     d.RTVFormats[0] = k.has_rt ? DXGI_FORMAT(k.rtfmt) : DXGI_FORMAT_UNKNOWN;
-    d.DSVFormat = k.has_ds ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
+    d.DSVFormat = k.has_ds ? kDepthFormat : DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = 1;
 }
 
@@ -1628,7 +1642,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
         info.flags |= kTexWide;
     }
     if (ext_) ext_->Sampled(d, &t, 0, info);
-    sv.Format = t.depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : t.fmt;
+    sv.Format = t.depth ? kDepthRead : t.fmt;
     // the console reads the pixels it is about to overwrite: give the draw a copy
     if (feedback) return Feedback(t);
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1916,11 +1930,10 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
     if (stages.info[i].shadow) {
-        // the console tests texel OP r, D3D12 tests r OP texel
-        static const uint8_t swap[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+        // the console tests texel OP r, D3D12 tests r OP texel; with both reversed (g_reversed_depth) it is the same OP
         sd.Filter = lin(min) || lin(mag) ? D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
                                          : D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
-        sd.ComparisonFunc = D3D12_COMPARISON_FUNC(swap[Cmp(s.rs[kRsShadowFunc]) - 1] + 1);
+        sd.ComparisonFunc = Cmp(s.rs[kRsShadowFunc]);
         sd.MaxAnisotropy = 0;
     }
     return sd;
@@ -1994,7 +2007,7 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
         sh.vh = vit->second;
         return;
     }
-    std::string src = VertexHlsl(s, a, sh);
+    std::string src = ReversedDepthHlsl(VertexHlsl(s, a, sh));
     sh.vs_code = Compile(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
     shader_src_[sh.vkey] = sh.vh;
 }
@@ -2040,7 +2053,16 @@ void KeyBlend(const State& s, PsoKey& k) {
     k.wmask = ((cw >> 16) & 1) | ((cw >> 8) & 1) << 1 | (cw & 1) << 2 | ((cw >> 24) & 1) << 3;
 }
 
-constexpr float kDepth24Max = 16777215.0f;  // 2^24 minus 1: a 24 bit depth buffer's units per 1.0
+constexpr uint32_t kZUseW = 2;  // D3DZB_USEW
+
+bool OffsetsPolygons(const State& s, Topology topology) {
+    return topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable);
+}
+
+// polygon offset slopes are per console pixel, an upscaled target's pixels are smaller
+float HostSlopeScale(const State& s, const Target* ds) {
+    return Bits(SimpleState(s, kMSlopeScale)) * (ds ? float(ds->w) / ds->gw : 1.0f);
+}
 
 void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k) {
     k.zen = s.rs[kRsZEnable] != 0;
@@ -2057,12 +2079,8 @@ void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k
         k.szfail = SimpleState(s, kMStencilZFail);
         k.spass = SimpleState(s, kMStencilPass);
     }
-    // polygon offset: bias in depth buffer units, the target is always 24 bit; the slope is per console pixel,
-    // and an upscaled target's pixels are smaller
-    if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable)) {
-        k.zbias = int32_t(std::lround(Bits(SimpleState(s, kMDepthOffset)) * kDepth24Max / s.zscale));
-        k.zslope = Bits(SimpleState(s, kMSlopeScale)) * (bound_ds_ ? float(bound_ds_->w) / bound_ds_->gw : 1.0f);
-    }
+    // polygon offset: the slope here, toward the camera is up on reversed depth; the units are in ReversedDepthHlsl
+    if (OffsetsPolygons(s, a.topology)) k.zslope = -HostSlopeScale(s, bound_ds_);
 }
 
 void KeyRasterizer(const State& s, const Assembled& a, PsoKey& k) {
@@ -2281,6 +2299,55 @@ void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
     }
 }
 
+// a w buffer's clip range in the units of a draw's clip w
+struct WRange {
+    float near_w;
+    float far_w;
+};
+
+// the projection's near and far clip w as D3DDevice_SetTransform finds them
+WRange ProjectionWRange(const float* m) {
+    float m33 = m[10];
+    float m34 = m[11];
+    float m43 = m[14];
+    float m44 = m[15];
+    if (m33 == m34 || m33 == 0) return {0, 1};
+    return {m44 - m43 / m33 * m34, (m44 - m43) / (m33 - m34) * m34 + m44};
+}
+
+// NV097_SET_CLIP_MIN and MAX in buffer units, sent by D3DDevice_SetDepthClipPlanes
+constexpr uint32_t kMClipMin = 0x394;
+constexpr uint32_t kMClipMax = 0x398;
+constexpr float kFallbackNear = 1.0f / 65536;  // of the far w, when no range is known
+
+// Fixed function clip w is the host's view depth over the projection's range; a program's is in buffer units up to
+// zscale, its near end the clip minimum the title sent
+WRange DrawWRange(const State& s, bool program) {
+    WRange r{0, s.zscale};
+    if (!program) {
+        r = ProjectionWRange(s.transforms[kTsProjection].data());
+    } else if (SimpleState(s, kMClipMax)) {
+        r.near_w = Bits(SimpleState(s, kMClipMin));
+    }
+    if (r.near_w <= 0 || r.near_w >= r.far_w) r.near_w = r.far_w * kFallbackNear;
+    return r;
+}
+
+// ReversedDepthHlsl's zparams: x the w buffer's scale (0 for a z buffer), y its far w, z the polygon offset in units of
+// the clip w for a w buffer, of depth for a z buffer
+void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const {
+    bool offset = OffsetsPolygons(s, Topology(k.topo));
+    float units = offset ? Bits(SimpleState(s, kMDepthOffset)) : 0;
+    if (s.rs[kRsZEnable] != kZUseW) {
+        c.zparams[2] = units / s.zscale;
+        return;
+    }
+    WRange r = DrawWRange(s, sh.prog);
+    c.zparams[0] = r.near_w / (r.far_w - r.near_w);
+    c.zparams[1] = r.far_w;
+    c.zparams[2] = sh.prog ? units : units * r.far_w / s.zscale;
+}
+
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                                    GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
@@ -2292,6 +2359,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
+    FillDepthConstants(s, sh, k, c);
     FillTextureConstants(s, sh, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
@@ -2372,7 +2440,7 @@ void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::stri
 }
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
-    std::string src = VertexHlsl(s, a, sh);
+    std::string src = ReversedDepthHlsl(VertexHlsl(s, a, sh));
     CaptureShader("vs", sh.vkey, sh.quad ? QuadHlsl(std::move(src)) : src);
     CaptureShader("ps", sh.pkey, PixelHlsl(pk));
 }
@@ -2673,8 +2741,9 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         D3D12_CLEAR_FLAGS cf = D3D12_CLEAR_FLAGS(((c.flags & kClearZ) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                                                  ((c.flags & kClearStencil) ? D3D12_CLEAR_FLAG_STENCIL : 0));
-        cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_), cf, std::clamp(c.z, 0.0f, 1.0f),
-                                   UINT8(c.stencil), UINT(rs.size()), rs.data());
+        float reversed = 1 - std::clamp(c.z, 0.0f, 1.0f);
+        cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_), cf, reversed, UINT8(c.stencil),
+                                   UINT(rs.size()), rs.data());
     } else {
         // pixels the CPU wrote before this clear go in first, a later upload would paint over the clear
         if (LatchCpuWrite(t)) UploadTarget(t, s.rt);
@@ -3427,7 +3496,7 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
 }
 
 void D3D12Backend::CapSave(Target& t, const char* name) {
-    DXGI_FORMAT fmt = t.depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : t.fmt;
+    DXGI_FORMAT fmt = t.depth ? kDepthRead : t.fmt;
     float mul = t.depth ? 1 : t.range;
     CapSave({.res = t.res.Get(), .state = &t.state, .fmt = fmt, .w = t.gw, .h = t.gh, .mul = mul}, name);
 }

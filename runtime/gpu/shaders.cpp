@@ -54,6 +54,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 amb;
     float4 lt[56];
     float4 rtshift;
+    float4 zparams;
 };
 )";
 
@@ -543,10 +544,11 @@ bool PixelKey::operator==(const PixelKey& o) const { return std::memcmp(this, &o
 std::string ShaderHooks::Constants() const { return "    float4 ext;\n"; }
 
 std::string ShaderHooks::Shadow() const {
+    std::string r = g_reversed_depth ? "1 - clamp(z, 0, mx) / mx" : "clamp(z, 0, mx) / mx";
     return R"(// the sampler compares, a linear filter blends the four results like the console does
 float4 shadow(Texture2D<float> t, SamplerComparisonState s, float2 uv, float z, int fmt, float2 px, float2 size) {
     float mx = fmt == 2 ? 65535.0 : 16777215.0;
-    return t.SampleCmpLevelZero(s, uv, clamp(z, 0, mx) / mx).xxxx;
+    return t.SampleCmpLevelZero(s, uv, )" + r + R"().xxxx;
 }
 )";
 }
@@ -963,6 +965,33 @@ std::string QuadHlsl(std::string s) {
 }
 )", "");
     for (int i = 0; i < 4; i++) sub(F("i.tc%d", i).c_str(), "unstretch(", ", i.e)");
+    return s;
+}
+
+namespace {
+
+// A w buffer's reversed depth comes from the clip w alone, zparams.x * (zparams.y / w - 1), exact where z / w had
+// already rounded away; a z buffer's is 1 - z. zparams.z is the polygon offset in the units of each
+const char* kReversedClipHlsl = R"(float ReversedClip(float z, float w) {
+    if (zparams.x != 0) return zparams.x * (zparams.y - (w + zparams.z));
+    return w - z - zparams.z * w;
+}
+)";
+
+bool InsertAfter(std::string& s, const char* at, const char* text) {
+    size_t p = s.find(at);
+    if (p == std::string::npos) return false;
+    s.insert(p + std::strlen(at), text);
+    return true;
+}
+
+}  // namespace
+
+std::string ReversedDepthHlsl(std::string s) {
+    size_t entry = s.find("VOut main(");
+    if (entry != std::string::npos) s.insert(entry, kReversedClipHlsl);
+    InsertAfter(s, "    o.pos = q;\n", "    o.pos.z = ReversedClip(q.z, q.w);\n");
+    InsertAfter(s, "    o.pos = cp;\n", "    o.pos.z = ReversedClip(cp.z, cp.w);\n");
     return s;
 }
 
