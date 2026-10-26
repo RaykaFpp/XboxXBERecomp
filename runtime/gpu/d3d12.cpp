@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -406,6 +407,29 @@ struct DrawTextures {
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
 };
 
+// what the last draw set on the command list, so the next one sets only what differs; anything else that sets them
+// clears it
+struct DrawBinds {
+    ID3D12PipelineState* pso = nullptr;
+    D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    bool rasterizer = false;  // viewport and scissor hold
+    D3D12_VIEWPORT viewport{};
+    D3D12_RECT scissor{};
+    bool output = false;  // blend and stencil hold
+    float blend[4] = {};
+    uint32_t stencil = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS vsc = 0;  // root constant buffers
+    D3D12_GPU_VIRTUAL_ADDRESS dc = 0;
+    uint32_t views = UINT32_MAX;  // root descriptor table slots
+    uint32_t samplers = UINT32_MAX;
+};
+
+// the last targets EnsureTarget and FindTarget marked used, so target_used_ is written once a frame each
+struct UsedTarget {
+    uint32_t data = 0;
+    uint64_t frame = UINT64_MAX;
+};
+
 // a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
 struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
@@ -559,6 +583,7 @@ private:
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s);
+    void UpdateTargetUsed(uint32_t data);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
     // visibility tests
@@ -703,6 +728,9 @@ private:
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
+    std::array<UsedTarget, 4> recent_used_{};
+    uint32_t recent_used_next_ = 0;
+    DrawBinds binds_;
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, Tex> pack_textures_;  // texture pack images by key, kept for the run
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
@@ -943,6 +971,7 @@ void D3D12Backend::Begin() {
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
     bound_rt_ = bound_ds_ = nullptr;
+    binds_ = {};
 }
 
 void D3D12Backend::Submit(bool wait) {
@@ -978,6 +1007,7 @@ void D3D12Backend::SetFullViewport(uint32_t w, uint32_t h) {
     D3D12_RECT scissor{0, 0, LONG(w), LONG(h)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
+    binds_ = {};
 }
 
 // one w x h colour target for a Blit, the draw's bound targets forgotten
@@ -1122,7 +1152,7 @@ Target* D3D12Backend::FindTarget(const Surface& s, bool depth) {
     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
     TargetSlot slot = FindTargetSlot(s, depth, alt);
     if (!slot.sized) return nullptr;
-    target_used_[slot.data] = frame_;
+    UpdateTargetUsed(slot.data);
     return &slot.it->second;
 }
 
@@ -1132,7 +1162,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     uint64_t alt = 0;
     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
     TargetSlot slot = FindTargetSlot(s, depth, alt);
-    target_used_[slot.data] = frame_;
+    UpdateTargetUsed(slot.data);
     if (slot.sized) return &slot.it->second;
     if (slot.it != targets_.end()) ReleaseTarget(slot.it);
     Target t;
@@ -1150,6 +1180,14 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.sig = MemSig(slot.data, t.bytes);
     auto& ref = targets_[slot.key] = std::move(t);
     return &ref;
+}
+
+void D3D12Backend::UpdateTargetUsed(uint32_t data) {
+    for (const UsedTarget& u : recent_used_) {
+        if (u.data == data && u.frame == frame_) return;
+    }
+    target_used_[data] = frame_;
+    recent_used_[recent_used_next_++ % recent_used_.size()] = {data, frame_};
 }
 
 bool D3D12Backend::BindTargets(const State& s) {
@@ -1344,6 +1382,7 @@ uint32_t D3D12Backend::EnsureBlitSamplers() {
 // the full screen triangle: cb at b0 and b1, views at srv_slot; without a sampler slot EnsureBlitSamplers gives it
 void D3D12Backend::DrawFullScreen(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS cb, uint32_t srv_slot,
                                   std::optional<uint32_t> sampler_slot) {
+    binds_ = {};
     cl_->SetPipelineState(pso);
     cl_->SetGraphicsRootConstantBufferView(0, cb);
     cl_->SetGraphicsRootConstantBufferView(1, cb);
@@ -1480,6 +1519,7 @@ void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3
     if (blend >= 0) {
         float f[4] = {blend, blend, blend, blend};
         cl_->OMSetBlendFactor(f);
+        binds_ = {};
     }
     DrawFullScreen(pso, cb.gpu, slot);
     bound_rt_ = bound_ds_ = nullptr;
@@ -2383,8 +2423,10 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
         last_dc_ = c;
         last_dc_gpu_ = dc.gpu;
     }
-    cl_->SetGraphicsRootConstantBufferView(0, last_vsc_gpu_);
-    cl_->SetGraphicsRootConstantBufferView(1, last_dc_gpu_);
+    if (last_vsc_gpu_ != binds_.vsc) cl_->SetGraphicsRootConstantBufferView(0, last_vsc_gpu_);
+    if (last_dc_gpu_ != binds_.dc) cl_->SetGraphicsRootConstantBufferView(1, last_dc_gpu_);
+    binds_.vsc = last_vsc_gpu_;
+    binds_.dc = last_dc_gpu_;
 }
 
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
@@ -2526,9 +2568,11 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
         stages.sv[i].Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
     uint32_t views = EnsureViewSet(stages);
-    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
+    if (views != binds_.views) cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
+    binds_.views = views;
     uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
-    cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
+    if (samplers != binds_.samplers) cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
+    binds_.samplers = samplers;
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
@@ -2536,7 +2580,6 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
-    cl_->RSSetViewports(1, &vp);
     float sc = W / gw;
     LONG x0 = LONG(s.viewport.x * sc);
     LONG y0 = LONG(s.viewport.y * sc);
@@ -2550,14 +2593,26 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    bool same = binds_.rasterizer && !std::memcmp(&vp, &binds_.viewport, sizeof(vp)) &&
+                !std::memcmp(&rect, &binds_.scissor, sizeof(rect));
+    if (same) return;
+    cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &rect);
+    binds_.rasterizer = true;
+    binds_.viewport = vp;
+    binds_.scissor = rect;
 }
 
 void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
     float bf[4];
     Color(SimpleState(s, kMBlendColor), bf);
+    uint32_t ref = SimpleState(s, kMStencilRef) & 0xFF;
+    if (binds_.output && !std::memcmp(bf, binds_.blend, sizeof(bf)) && ref == binds_.stencil) return;
     cl_->OMSetBlendFactor(bf);
-    cl_->OMSetStencilRef(SimpleState(s, kMStencilRef) & 0xFF);
+    cl_->OMSetStencilRef(ref);
+    binds_.output = true;
+    std::memcpy(binds_.blend, bf, sizeof(bf));
+    binds_.stencil = ref;
 }
 
 D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
@@ -2581,7 +2636,9 @@ void D3D12Backend::UploadVertexBuffers(const Assembled& a) {
 
 void D3D12Backend::DrawGeometry(const Assembled& a) {
     UploadVertexBuffers(a);
-    cl_->IASetPrimitiveTopology(PrimitiveTopology(a));
+    D3D_PRIMITIVE_TOPOLOGY topology = PrimitiveTopology(a);
+    if (topology != binds_.topology) cl_->IASetPrimitiveTopology(topology);
+    binds_.topology = topology;
     if (a.index_count) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Alloc ib = Upload(ibytes, 4);
@@ -2711,13 +2768,16 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
-    cl_->SetPipelineState(pso);
+    if (ext_) binds_ = {};  // the extension may set anything
+    if (pso != binds_.pso) cl_->SetPipelineState(pso);
+    binds_.pso = pso;
 
     // constants
     GuestExtent size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
+    if (ext_) binds_ = {};
 
     if (cap_) {
         CaptureDraw(s, prim, count, k, c, stages);
@@ -2809,6 +2869,7 @@ void D3D12Backend::ClearChannels(Target& t, const float col[4], uint8_t mask, co
     uint32_t slot = AllocSrvSlots(1);
     for (const D3D12_RECT& r : rs) {
         cl_->RSSetScissorRects(1, &r);
+        binds_ = {};
         DrawFullScreen(pso, cb.gpu, slot);
     }
 }
@@ -2932,6 +2993,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) continue;
         cl_->RSSetViewports(1, &vp);
         cl_->RSSetScissorRects(1, &scissor);
+        binds_ = {};
         float uv[4] = {r.x0 / src_t.gw, r.y0 / src_t.gh, (r.x1 - r.x0) / src_t.gw, (r.y1 - r.y0) / src_t.gh};
         uint32_t taps = uint32_t(std::ceil(std::max(src_scale / dst_scale, 1.0f) - kTapsSlack));
         float mul = 1 / dst_t.range;
@@ -3101,6 +3163,7 @@ void D3D12Backend::BlitFrame(Target& t) {
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
+    binds_ = {};
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
 }
