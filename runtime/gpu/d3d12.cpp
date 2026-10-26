@@ -406,14 +406,6 @@ struct DrawTextures {
     float wide[4] = {};         // host texels per console texel of a target read into a smaller one, 0 otherwise
 };
 
-// the last draw's texture views and their slots, reused by a draw with the same views in the same frame
-struct ViewTable {
-    ID3D12Resource* res[4] = {};
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv[4] = {};
-    uint32_t slot = 0;
-    uint64_t frame = UINT64_MAX;
-};
-
 // a draw's shaders: what they are made from, their cache keys, the hashes Compile returned and the compiled blobs
 struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
@@ -563,7 +555,7 @@ private:
     void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
-    bool SameViews(const DrawTextures& stages) const;
+    uint32_t EnsureViewSet(const DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
     void SetViewportScissor(const State& s, uint32_t gw);
     void SetBlendFactorStencilRef(const State& s);
@@ -682,7 +674,10 @@ private:
     uint64_t fence_value_ = 0;
     Frame frames_[kFrames];
     uint64_t frame_ = 0;
-    ViewTable last_views_;
+    // texture view sets made since the descriptor ring last started over, by a hash of their resources and views, to
+    // their first slot; resources freed in that time go to the frame's garbage, so no other one takes their address
+    std::unordered_map<uint64_t, uint32_t> view_sets_;
+    uint64_t view_sets_frame_ = UINT64_MAX;
     // the constants last uploaded in this command list, reused while a draw's are the same; 0 after a submit
     decltype(State::vsc) last_vsc_{};
     D3D12_GPU_VIRTUAL_ADDRESS last_vsc_gpu_ = 0;
@@ -965,7 +960,7 @@ void D3D12Backend::Submit(bool wait) {
         f.garbage.clear();
         f.used = 0;
         f.srv = 0;
-        last_views_.frame = UINT64_MAX;
+        view_sets_.clear();
         cl_->Reset(f.alloc.Get(), nullptr);
         Begin();
     }
@@ -1020,7 +1015,7 @@ uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
     if (f.srv + n > per) {
         LOG_FIRST(4, "d3d12: descriptor ring wrapped within a frame");
         f.srv = 0;
-        last_views_.frame = UINT64_MAX;
+        view_sets_.clear();
     }
     uint32_t i = uint32_t(frame_ % kFrames) * per + f.srv;
     f.srv += n;
@@ -2506,10 +2501,21 @@ bool AnyStageWraps(const State& s) {
     return false;
 }
 
-bool D3D12Backend::SameViews(const DrawTextures& stages) const {
-    if (last_views_.frame != frame_) return false;
-    if (std::memcmp(last_views_.res, stages.res, sizeof(stages.res))) return false;
-    return !std::memcmp(last_views_.sv, stages.sv, sizeof(stages.sv));
+// the first slot of the stages' four views, made only when this frame has not made the same set yet
+uint32_t D3D12Backend::EnsureViewSet(const DrawTextures& stages) {
+    if (view_sets_frame_ != frame_) {
+        view_sets_.clear();
+        view_sets_frame_ = frame_;
+    }
+    uint64_t key = Hash(stages.sv, sizeof(stages.sv), Hash(stages.res, sizeof(stages.res)));
+    auto it = view_sets_.find(key);
+    if (it != view_sets_.end()) return it->second;
+    uint32_t slot = AllocSrvSlots(4);
+    for (int i = 0; i < 4; i++) {
+        dev_->CreateShaderResourceView(stages.res[i], &stages.sv[i], Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+    view_sets_[key] = slot;
+    return slot;
 }
 
 // a stage without a texture gets a null view of its kind; the samplers read the views after
@@ -2519,17 +2525,8 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
         stages.sv[i].ViewDimension = NullViewDimension(stages.info[i].kind);
         stages.sv[i].Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
-    if (!SameViews(stages)) {
-        uint32_t slot = AllocSrvSlots(4);
-        for (int i = 0; i < 4; i++) {
-            dev_->CreateShaderResourceView(stages.res[i], &stages.sv[i], Cpu(srv_heap_.Get(), slot + i, srv_inc_));
-        }
-        std::memcpy(last_views_.res, stages.res, sizeof(stages.res));
-        std::memcpy(last_views_.sv, stages.sv, sizeof(stages.sv));
-        last_views_.slot = slot;
-        last_views_.frame = frame_;
-    }
-    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), last_views_.slot, srv_inc_));
+    uint32_t views = EnsureViewSet(stages);
+    cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
     uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
     cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
 }
