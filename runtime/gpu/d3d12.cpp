@@ -550,6 +550,7 @@ private:
     float TargetScale() const;  // host pixels per console pixel of the bound target
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
+    uint8_t* UploadVertexConstants(const State& s);
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                          GuestExtent size, DrawConstants& c);
     void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
@@ -682,6 +683,11 @@ private:
     Frame frames_[kFrames];
     uint64_t frame_ = 0;
     ViewTable last_views_;
+    // the constants last uploaded in this command list, reused while a draw's are the same; 0 after a submit
+    decltype(State::vsc) last_vsc_{};
+    D3D12_GPU_VIRTUAL_ADDRESS last_vsc_gpu_ = 0;
+    DrawConstants last_dc_{};
+    D3D12_GPU_VIRTUAL_ADDRESS last_dc_gpu_ = 0;
     ComPtr<ID3D12GraphicsCommandList> cl_;
     ComPtr<ID3D12DescriptorHeap> srv_heap_;
     ComPtr<ID3D12DescriptorHeap> smp_heap_;
@@ -945,6 +951,8 @@ void D3D12Backend::Begin() {
 }
 
 void D3D12Backend::Submit(bool wait) {
+    last_vsc_gpu_ = 0;
+    last_dc_gpu_ = 0;
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
     queue_->ExecuteCommandLists(1, lists);
@@ -2348,26 +2356,40 @@ void D3D12Backend::FillDepthConstants(const State& s, const DrawShaders& sh, con
     c.zparams[2] = sh.prog ? units : units * r.far_w / s.zscale;
 }
 
-void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestExtent size, DrawConstants& c) {
+// a fresh copy of the draw's vertex constants, kept as the last upload
+uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
     Alloc vc = Upload(sizeof(s.vsc), 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
-    Alloc dc = Upload(sizeof(DrawConstants), 256);
+    std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+    last_vsc_gpu_ = vc.gpu;
+    return vc.cpu;
+}
+
+void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
+                                   GuestExtent size, DrawConstants& c) {
+    // the extension edits the uploaded copy, so its draws always get their own
+    bool same = !ext_ && last_vsc_gpu_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+    uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
     FillSurfaceConstants(s, size, c);
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
-    if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
+    if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
     FillDepthConstants(s, sh, k, c);
     FillTextureConstants(s, sh, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
     }
-    std::memcpy(dc.cpu, &c, sizeof(c));
-    cl_->SetGraphicsRootConstantBufferView(0, vc.gpu);
-    cl_->SetGraphicsRootConstantBufferView(1, dc.gpu);
+    if (!last_dc_gpu_ || std::memcmp(&last_dc_, &c, sizeof(c))) {
+        Alloc dc = Upload(sizeof(DrawConstants), 256);
+        std::memcpy(dc.cpu, &c, sizeof(c));
+        last_dc_ = c;
+        last_dc_gpu_ = dc.gpu;
+    }
+    cl_->SetGraphicsRootConstantBufferView(0, last_vsc_gpu_);
+    cl_->SetGraphicsRootConstantBufferView(1, last_dc_gpu_);
 }
 
 void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
