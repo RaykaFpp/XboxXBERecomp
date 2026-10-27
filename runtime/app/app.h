@@ -14,7 +14,7 @@ struct Pad;
 namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
-inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: just under the monitor's refresh rate
+inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
 
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;

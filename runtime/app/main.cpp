@@ -224,10 +224,7 @@ void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
-    // a few under the refresh rate, so a variable refresh display stays in its range and vsync never waits a whole
-    // refresh
-    constexpr uint32_t kRefreshMargin = 3;
-    if (cap == kFpsCapRefresh) cap = RefreshRate() > kRefreshMargin ? RefreshRate() - kRefreshMargin : 0;
+    if (cap == kFpsCapRefresh) cap = RefreshRate();
     auto now = clock::now();
     if (!cap) {
         next = now;
