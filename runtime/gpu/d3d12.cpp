@@ -376,6 +376,7 @@ struct PsoKey {
     int32_t zbias;
     float zslope;
     uint32_t rtfmt;
+    uint32_t sprite;  // DrawShaders::sprite
 };
 
 // Blit's settings past the source and its rectangle
@@ -435,6 +436,7 @@ struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
+    bool sprite = false;           // a program's points drawn as point sprites (SpriteHlsl)
     FixedKey fk;
     uint64_t vkey = 0;
     uint64_t vh = 0;
@@ -562,7 +564,7 @@ private:
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
-    void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d);
+    void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
     float TargetScale() const;  // host pixels per console pixel of the bound target
     float RenderTargetShift(const State& s, const DrawShaders& sh) const;
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
@@ -1614,10 +1616,32 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.SampleDesc.Count = 1;
 }
 
-// a point is drawn as its whole console pixel by a geometry shader, solid, front facing and never culled
-void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+// A point sprite is a square of the program's point size in console pixels (oPts, which SpriteSizeHlsl passes in
+// tc3.x) with the sprite's coordinates across it, 0 to 1 from the top left, as the console makes them for stage 3.
+std::string SpriteHlsl() {
+    std::string s = PointHlsl();
+    s.erase(s.find("[maxvertexcount"));
+    return s + R"([maxvertexcount(4)]
+void main(point VOut v[1], inout TriangleStream<VOut> strip) {
+    float2 half_size = v[0].tc3.x * v[0].pos.w / surf.xy;  // in clip units, the target spans 2 across surf.xy pixels
+    for (int i = 0; i < 4; i++) {
+        VOut o = v[0];
+        float2 corner = float2(i & 1, i >> 1);
+        o.pos.x += (corner.x * 2 - 1) * half_size.x;
+        o.pos.y -= (corner.y * 2 - 1) * half_size.y;
+        o.tc0 = float4(corner, 0, 1);  // stage 3 drawn as stage 0 (SpriteStageZero)
+        o.tc3 = o.tc0;
+        strip.Append(o);
+    }
+}
+)";
+}
+
+// a point is drawn as its whole console pixel, or a sprite as its square, by a geometry shader, solid, front facing
+// and never culled
+void D3D12Backend::ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite) {
     uint64_t hash;
-    ID3DBlob* gs = Compile(PointHlsl(), "main", "gs_5_0", hash);
+    ID3DBlob* gs = Compile(sprite ? SpriteHlsl() : PointHlsl(), "main", "gs_5_0", hash);
     if (!gs) return;
     d.GS = {gs->GetBufferPointer(), gs->GetBufferSize()};
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1647,7 +1671,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.InputLayout = {el, n};
     FillPipelineDesc(k, vs, ps, d);
-    if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d);
+    if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
     ComPtr<ID3D12PipelineState> pso;
     g_perf.psos++;
     if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
@@ -2014,6 +2038,7 @@ DrawShaders ClassifyShaders(const State& s, const Assembled& a, uint32_t count) 
     bool points = a.topology == Topology::Points;
     sh.quad = count <= kQuadVertices && !s.rs[kRsZEnable] && !points;
     sh.fixed_transform = !sh.prog && !a.pretransformed;
+    sh.sprite = points && sh.prog && s.rs[kRsPointSpriteEnable];
     if (!sh.prog) sh.fk = MakeFixedKey(s);
     return sh;
 }
@@ -2027,18 +2052,35 @@ void EnsureProgramHash(const State& s) {
 constexpr uint64_t kDeclarationSalt = 0x10000;    // fixed function seed, above the 16 bit register mask
 constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function vertices, apart from untransformed
 constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
+constexpr uint64_t kSpriteSalt = 0x3C3C0000;      // the SpriteSizeHlsl variant
 
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
     uint64_t vkey = Hash(&a.decode, 8, seed);
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (sh.quad) vkey ^= kQuadSalt;
+    if (sh.sprite) vkey ^= kSpriteSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
     return vkey;
 }
 
+// a point sprite's program hands its point size to SpriteHlsl in tc3, whose coordinates the sprite makes
+std::string SpriteSizeHlsl(std::string s) {
+    const char* tc3 = "    o.tc3 = oT3;\n";
+    size_t at = s.find(tc3);
+    if (at == std::string::npos) {
+        LOGE("d3d12: a vertex shader no longer fits SpriteSizeHlsl");
+        return s;
+    }
+    s.replace(at, std::strlen(tc3), "    o.tc3 = oPts;\n");
+    return s;
+}
+
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+    if (sh.prog) {
+        std::string src = VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+        return sh.sprite ? SpriteSizeHlsl(std::move(src)) : src;
+    }
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
 
@@ -2734,7 +2776,37 @@ void D3D12Backend::DeliverReports() {
     }
 }
 
+constexpr uint32_t kPointList = 1;   // D3DPT_POINTLIST
+constexpr uint32_t kTopDisable = 1;  // the XDK's D3DTOP_DISABLE
+constexpr int kSpriteStage = 3;
+
+// a program's point sprites under the fixed function stages: the XDK builds their combiners from stage 3 alone,
+// the stage with the sprite's coordinates; a pixel shader reads t3 itself. SpriteStageZero disables stage 3.
+bool SpriteOnStage3(const State& s, uint32_t prim) {
+    bool prog = (s.vs_handle & 1) && s.vs && !s.vs->program.empty();
+    bool stage3 = s.tss[kSpriteStage][kTssColorOp] != kTopDisable;
+    return prim == kPointList && prog && !s.ps && s.rs[kRsPointSpriteEnable] && stage3;
+}
+
+// stage 3 drawn as stage 0, the only stage
+State SpriteStageZero(const State& s) {
+    State moved = s;
+    moved.tss[0] = s.tss[kSpriteStage];
+    moved.textures[0] = s.textures[kSpriteStage];
+    moved.palettes[0] = s.palettes[kSpriteStage];
+    for (int i = 1; i < 4; i++) {
+        moved.tss[i][kTssColorOp] = kTopDisable;
+        moved.tss[i][kTssAlphaOp] = kTopDisable;
+        moved.textures[i] = 0;
+    }
+    return moved;
+}
+
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    if (SpriteOnStage3(s, prim)) {
+        Draw(SpriteStageZero(s), prim, start, count, indices);
+        return;
+    }
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
     if (cap_) CapStep(s.rt);
@@ -2766,6 +2838,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // pipeline
     PsoKey k;
     BuildPipelineKey(s, a, sh.vh, sh.ph, k);
+    k.sprite = sh.sprite;
     ID3D12PipelineState* pso = EnsurePipeline(k, sh.vs_code, sh.ps_code);
     if (!pso) return;
     if (ext_) binds_ = {};  // the extension may set anything
