@@ -10,9 +10,9 @@
 #include "cpu/x86_ops.h"
 #include "kernel/kernel.h"
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #include <intrin.h>
-#else
+#elif defined(__i386__) || defined(__x86_64__)
 #include <x86intrin.h>
 #endif
 
@@ -184,8 +184,10 @@ void x86_trap(X86Context& ctx, uint32_t va, const char* what) {
     LOGE("guest trap at %08X: %s", va, what);
     kernel::LogGuestStack(ctx, 64);
     logx::Flush();
-#ifdef _WIN32
+#if defined(_WIN32)
     __debugbreak();
+#elif defined(__aarch64__) || defined(__arm__)
+    __builtin_trap();
 #endif
     std::abort();
 }

@@ -40,7 +40,12 @@ set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
-if(CMAKE_CROSSCOMPILING)
+if(ANDROID)
+    # SDL is supplied by the Android AAR/Prefab package. Only the app's other
+    # dependencies are built by this CMake project.
+    find_package(SDL3 REQUIRED CONFIG)
+    FetchContent_MakeAvailable(zydis tomlplusplus imgui)
+elseif(CMAKE_CROSSCOMPILING)
     # Zydis is only for the tools, which a cross build takes from the build machine (below)
     FetchContent_MakeAvailable(tomlplusplus imgui SDL3)
 else()
@@ -101,6 +106,42 @@ list(REMOVE_ITEM XBE_RUNTIME_SOURCES
     ${XBE_SDK_DIR}/runtime/gpu/vulkan.cpp
     ${XBE_SDK_DIR}/runtime/gpu/spirv.cpp
     ${XBE_SDK_DIR}/runtime/audio/sdl_audio.cpp)
+elseif(ANDROID)
+# Reuse the SDL/Vulkan and POSIX runtime, replacing desktop-only app integration.
+list(REMOVE_ITEM XBE_RUNTIME_SOURCES
+    ${XBE_SDK_DIR}/runtime/app/main.cpp
+    ${XBE_SDK_DIR}/runtime/app/main_sdl.cpp
+    ${XBE_SDK_DIR}/runtime/app/splash.cpp
+    ${XBE_SDK_DIR}/runtime/app/system_info.cpp
+    ${XBE_SDK_DIR}/runtime/app/handover.cpp
+    ${XBE_SDK_DIR}/runtime/gpu/d3d12.cpp
+    ${XBE_SDK_DIR}/runtime/audio/xaudio2.cpp)
+list(APPEND XBE_RUNTIME_SOURCES
+    ${XBE_SDK_DIR}/runtime/app/android_main.cpp
+    ${XBE_SDK_DIR}/runtime/app/android_splash.cpp
+    ${XBE_SDK_DIR}/runtime/app/android_system_info.cpp
+    ${XBE_SDK_DIR}/runtime/app/android_handover.cpp)
+list(REMOVE_DUPLICATES XBE_RUNTIME_SOURCES)
+find_library(XBE_VULKAN vulkan REQUIRED)
+find_library(XBE_ZLIB z REQUIRED)
+# The runtime compiles generated HLSL to SPIR-V on-device; Android needs glslang built in.
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_JS OFF CACHE BOOL "" FORCE)
+set(ENABLE_PCH OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG 14.3.0
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(glslang)
+set(XBE_SHADER_LIBS glslang SPIRV glslang-default-resource-limits)
+set(XBE_SHADER_DEFINES XBE_HAVE_GLSLANG=1)
+set(XBE_SHADER_INCLUDES ${glslang_SOURCE_DIR})
 else()
 # Win32-only sources out; the SDL/Vulkan counterparts in (globbed above,
 # appended explicitly so the contract survives a stale glob)
@@ -152,7 +193,9 @@ endif()
 message(STATUS "Vulkan shader compilers: DXC=${XBE_HAVE_DXC_FOUND} glslang=${XBE_HAVE_GLSLANG_FOUND}")
 endif()
 # SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
-set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+if(NOT ANDROID)
+    set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+endif()
 
 # One executable per recompiled image: its code from config/<config> (partitions as that config sets them),
 # the SDK runtime, XBE_HOST_SOURCES shared by every image of the game, and src/<game_dir> hooks only this image has.
@@ -186,6 +229,8 @@ function(add_xbe_image target xbe config partitions game_dir)
     file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\n")
     if(WIN32)
     add_executable(${target} WIN32 ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_IMGUI_SOURCES} ${XBE_HASH})
+    elseif(ANDROID)
+    add_library(${target} SHARED ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_IMGUI_SOURCES} ${XBE_HASH})
     else()
     add_executable(${target} ${XBE_RUNTIME_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_IMGUI_SOURCES} ${XBE_HASH})
     endif()
@@ -196,6 +241,13 @@ function(add_xbe_image target xbe config partitions game_dir)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     if(WIN32)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
+    elseif(ANDROID)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus SDL3::SDL3
+        ${XBE_VULKAN} ${XBE_ZLIB} ${XBE_SHADER_LIBS} android log dl)
+    target_compile_definitions(${target} PRIVATE XBE_ANDROID=1 ${XBE_SHADER_DEFINES})
+    target_link_options(${target} PRIVATE -Wl,--no-undefined)
+    target_include_directories(${target} SYSTEM PRIVATE ${XBE_SHADER_INCLUDES})
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME "main")
     else()
     # SDL3 plain, not LINK_ONLY: the app layer (main_sdl, vulkan surface) needs its headers too.
     # DXC is dlopen'd by gpu/spirv.cpp and so is never linked, only included.

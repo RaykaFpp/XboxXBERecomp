@@ -532,7 +532,8 @@ VkInstance VulkanInstance() {
         else LOGW("vulkan: XBE_VK_DEBUG set but VK_EXT_debug_utils is not available");
     }
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    appInfo.pApplicationName = "xbe-recomp"; appInfo.apiVersion = VK_API_VERSION_1_2;
+    appInfo.pApplicationName = "xbe-recomp";
+    appInfo.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &appInfo; ci.enabledExtensionCount = uint32_t(exts.size()); ci.ppEnabledExtensionNames = exts.data();
     ci.enabledLayerCount = uint32_t(layers.size()); ci.ppEnabledLayerNames = layers.data();

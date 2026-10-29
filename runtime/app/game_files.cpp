@@ -97,6 +97,9 @@ std::string WideToUtf8(const wchar_t* wide) {
 
 // assets beside the exe or in any folder above it (the build output)
 fs::path FindAssets() {
+#if defined(__ANDROID__)
+    return fs::path("/storage/emulated/0/Sims2");
+#else
     auto dir = ExeDir();
     for (int i = 0; i < 6; i++) {
         std::error_code ec;
@@ -109,6 +112,7 @@ fs::path FindAssets() {
         dir = dir.parent_path();
     }
     return {};
+#endif
 }
 
 // this executable's xbe among the extracted files, whatever case its name landed in

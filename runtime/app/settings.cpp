@@ -50,7 +50,14 @@ uint32_t ChosenAspect() {
     return 0;
 }
 
-std::filesystem::path File() { return ExeDir() / kGame.settings; }
+std::filesystem::path File() {
+#if defined(__ANDROID__)
+    const char* path = SDL_GetAndroidInternalStoragePath();
+    return std::filesystem::path(path ? path : ".") / kGame.settings;
+#else
+    return ExeDir() / kGame.settings;
+#endif
+}
 
 }  // namespace
 
@@ -136,7 +143,11 @@ void LogSettings() {
 }
 
 Mode Desktop() {
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
+    if (mode && mode->w > 0 && mode->h > 0) return {uint32_t(mode->w), uint32_t(mode->h)};
+    return {1280, 720};
+#elif defined(_WIN32)
     HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);

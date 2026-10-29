@@ -12,6 +12,9 @@ struct Pad {
 };
 
 void Init();  // window thread, before boot
+// Add the active virtual touchscreen controller to port 0; pass a disconnected Pad to clear it.
+void SetTouchPad(const Pad& pad);
+void SetTouchControl(int slot, bool active, const Pad& pad);
 // the controller on that port, then GameInfo::pad
 Pad Poll(int port);
 void Rumble(int port, uint16_t left, uint16_t right);
